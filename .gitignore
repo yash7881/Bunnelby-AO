@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 .venv/
 .venv-tts/
+.venv-wake/
 venv/
 .pytest_cache/
 .mypy_cache/
