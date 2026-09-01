@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_STT_MODEL = "small"
@@ -16,6 +18,8 @@ DEFAULT_STT_COMPUTE_TYPE = "int8"
 DEFAULT_STT_CPU_THREADS = 4
 DEFAULT_STT_BEAM_SIZE = 5
 DEFAULT_STT_MAX_AUDIO_BYTES = 12 * 1024 * 1024
+DEFAULT_STT_MAX_SAMPLE_SECONDS = 120.0
+STT_SAMPLE_RATE = 16_000
 SUPPORTED_LANGUAGE_HINTS = {"auto", "en", "hi"}
 
 _CONTENT_TYPE_SUFFIXES = {
@@ -114,6 +118,15 @@ def stt_max_audio_bytes() -> int:
     return max(64 * 1024, min(value, 100 * 1024 * 1024))
 
 
+def stt_max_sample_seconds() -> float:
+    raw = os.getenv("STT_MAX_SAMPLE_SECONDS", str(DEFAULT_STT_MAX_SAMPLE_SECONDS)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_STT_MAX_SAMPLE_SECONDS
+    return max(5.0, min(value, 300.0))
+
+
 def stt_model_root() -> Path:
     configured = os.getenv("STT_MODEL_ROOT", "").strip()
     if configured:
@@ -197,16 +210,92 @@ def _normalize_text(parts: list[str]) -> str:
     return " ".join(part.strip() for part in parts if part and part.strip()).strip()
 
 
+def _result_from_transcription(segments: Any, info: Any, language_hint: str) -> TranscriptionResult:
+    text = _normalize_text([str(segment.text) for segment in segments])
+    detected_language = str(getattr(info, "language", "") or language_hint or "auto")
+    probability = float(getattr(info, "language_probability", 0.0) or 0.0)
+    duration = float(getattr(info, "duration", 0.0) or 0.0)
+    return TranscriptionResult(
+        text=text,
+        language=detected_language,
+        language_probability=max(0.0, min(probability, 1.0)),
+        duration_seconds=max(0.0, duration),
+    )
+
+
+def _transcribe_source(
+    source: Any,
+    *,
+    language_hint: str,
+    vad_filter: bool,
+) -> TranscriptionResult:
+    model = _load_model()
+    try:
+        kwargs: dict[str, Any] = {
+            "language": None if language_hint == "auto" else language_hint,
+            "task": "transcribe",
+            "beam_size": stt_beam_size(),
+            "temperature": 0.0,
+            "condition_on_previous_text": False,
+            "vad_filter": vad_filter,
+            "word_timestamps": False,
+        }
+        if vad_filter:
+            kwargs["vad_parameters"] = {"min_silence_duration_ms": 350}
+        segments, info = model.transcribe(source, **kwargs)
+        return _result_from_transcription(segments, info, language_hint)
+    except STTServiceError:
+        raise
+    except Exception as exc:
+        logger.warning("Bunnelby STT inference failed: %s", exc)
+        raise STTTranscriptionError("Local speech recognition failed for this audio.") from exc
+
+
+def transcribe_samples(
+    samples: np.ndarray,
+    *,
+    sample_rate: int = STT_SAMPLE_RATE,
+    language: str | None = "auto",
+) -> TranscriptionResult:
+    """Transcribe a microphone utterance directly from RAM.
+
+    This path is intended for Bunnelby's post-wake conversation runtime. The waveform is
+    passed to faster-whisper as a numpy array, so no temporary audio file is created.
+    External conversation VAD should already have isolated the user's utterance; a second
+    Whisper VAD pass is therefore disabled to avoid trimming words at the boundaries.
+    """
+    if not stt_enabled():
+        raise STTDisabledError("Local speech recognition is disabled.")
+    if int(sample_rate) != STT_SAMPLE_RATE:
+        raise STTAudioError(f"RAM STT expects {STT_SAMPLE_RATE} Hz mono audio.")
+
+    waveform = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if waveform.size == 0:
+        raise STTAudioError("Audio samples are empty.")
+    duration = waveform.size / float(STT_SAMPLE_RATE)
+    if duration > stt_max_sample_seconds():
+        raise STTAudioError("Audio samples are too long for a single Bunnelby utterance.")
+    if not np.isfinite(waveform).all():
+        raise STTAudioError("Audio samples contain invalid values.")
+
+    language_hint = _validate_language_hint(language)
+    return _transcribe_source(
+        np.ascontiguousarray(waveform),
+        language_hint=language_hint,
+        vad_filter=False,
+    )
+
+
 def transcribe_audio(
     audio_bytes: bytes,
     *,
     content_type: str | None = None,
     language: str | None = "auto",
 ) -> TranscriptionResult:
-    """Transcribe one short local utterance and delete the temporary audio immediately.
+    """Transcribe uploaded local audio and delete the temporary file immediately.
 
-    The model is loaded lazily and cached in-process. The first invocation may download the
-    configured model into Bunnelby's local model directory; subsequent inference is local.
+    Browser-originated formats such as WebM still require decode-from-file compatibility.
+    The microphone runtime uses transcribe_samples() instead and stays RAM-only.
     """
     if not stt_enabled():
         raise STTDisabledError("Local speech recognition is disabled.")
@@ -216,7 +305,6 @@ def transcribe_audio(
         raise STTAudioError("Audio payload is too large for a single Bunnelby utterance.")
 
     language_hint = _validate_language_hint(language)
-    model = _load_model()
     temp_path: str | None = None
 
     try:
@@ -224,34 +312,10 @@ def transcribe_audio(
         with tempfile.NamedTemporaryFile(prefix="bunnelby-stt-", suffix=suffix, delete=False) as handle:
             handle.write(bytes(audio_bytes))
             temp_path = handle.name
-
-        try:
-            segments, info = model.transcribe(
-                temp_path,
-                language=None if language_hint == "auto" else language_hint,
-                task="transcribe",
-                beam_size=stt_beam_size(),
-                temperature=0.0,
-                condition_on_previous_text=False,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 350},
-                word_timestamps=False,
-            )
-            text = _normalize_text([str(segment.text) for segment in segments])
-        except STTServiceError:
-            raise
-        except Exception as exc:
-            logger.warning("Bunnelby STT inference failed: %s", exc)
-            raise STTTranscriptionError("Local speech recognition failed for this audio.") from exc
-
-        detected_language = str(getattr(info, "language", "") or language_hint or "auto")
-        probability = float(getattr(info, "language_probability", 0.0) or 0.0)
-        duration = float(getattr(info, "duration", 0.0) or 0.0)
-        return TranscriptionResult(
-            text=text,
-            language=detected_language,
-            language_probability=max(0.0, min(probability, 1.0)),
-            duration_seconds=max(0.0, duration),
+        return _transcribe_source(
+            temp_path,
+            language_hint=language_hint,
+            vad_filter=True,
         )
     finally:
         if temp_path:
