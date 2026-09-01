@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 
+from .cross_tool_fastpath import handle_cross_tool_fast_request
 from .cross_tool_reasoning import (
     CrossToolWriteNotSupportedError,
-    handle_cross_tool_request,
     is_cross_tool_request,
 )
 from .message_dispatch import handle_message_result as _legacy_dispatch
@@ -16,15 +16,15 @@ logger = logging.getLogger(__name__)
 def handle_message_result(user_message: str) -> OrchestratorResult:
     """Top-level intelligence facade introduced in Part 9.
 
-    Cross-tool reasoning lives here while existing single-tool Gmail/Calendar behavior
-    remains delegated to the proven dispatcher. Future parts can migrate tools behind the
-    registry without changing the /chat API contract.
+    Explicit Gmail+Calendar reads use the typed local fast path: deterministic routing,
+    independent R1 reads in parallel, then one quality-preserving synthesis stage. Existing
+    single-tool Gmail/Calendar behavior remains delegated to the proven dispatcher.
     """
     if not is_cross_tool_request(user_message):
         return _legacy_dispatch(user_message)
 
     try:
-        result = handle_cross_tool_request(user_message)
+        result = handle_cross_tool_fast_request(user_message)
     except CrossToolWriteNotSupportedError as exc:
         message = str(exc)
         return OrchestratorResult(
@@ -63,5 +63,6 @@ def handle_message_result(user_message: str) -> OrchestratorResult:
             "steps_succeeded": succeeded,
             "steps_failed": failed,
             "plan_source": result.plan.source,
+            "latency_ms": dict(result.timings_ms),
         },
     )
