@@ -10,6 +10,8 @@ from typing import Any
 
 import numpy as np
 
+from .cuda_runtime import configure_windows_cuda_dll_directories
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_STT_MODEL = "small"
@@ -157,6 +159,11 @@ def _load_model() -> Any:
     with _model_lock:
         if _model is not None and _model_signature == signature:
             return _model
+
+        if stt_device().casefold() == "cuda":
+            added = configure_windows_cuda_dll_directories()
+            if added:
+                logger.info("Registered Bunnelby-local CUDA DLL directories: %s", added)
 
         try:
             from faster_whisper import WhisperModel
