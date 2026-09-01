@@ -178,6 +178,33 @@ def dispatch_to_chat(api_url: str, transcript: str) -> dict[str, object]:
     return decoded
 
 
+def _print_backend_latency(response: dict[str, object], round_trip_seconds: float) -> None:
+    print(f"Local /chat round-trip: {round_trip_seconds:.2f}s")
+    timings = response.get("latency_ms")
+    if not isinstance(timings, dict) or not timings:
+        return
+
+    print("Backend latency breakdown:")
+    preferred_order = (
+        "planner_ms",
+        "tool_gmail.read_ms",
+        "tool_calendar.read_ms",
+        "tools_wall_ms",
+        "synthesis_ms",
+        "cross_tool_total_ms",
+    )
+    shown: set[str] = set()
+    for key in preferred_order:
+        value = timings.get(key)
+        if isinstance(value, (int, float)):
+            print(f"  {key}: {float(value):.0f} ms")
+            shown.add(key)
+    for key, value in timings.items():
+        if key in shown or not isinstance(value, (int, float)):
+            continue
+        print(f"  {key}: {float(value):.0f} ms")
+
+
 def run(args: argparse.Namespace) -> int:
     model_path = ensure_silero_vad_model()
     wake_model = load_wake_asr()
@@ -265,7 +292,11 @@ def run(args: argparse.Namespace) -> int:
                 if args.dispatch:
                     print("State: THINKING — dispatching transcript to existing /chat pipeline")
                     try:
+                        dispatch_started = time.perf_counter()
                         response = dispatch_to_chat(args.api_url, transcript)
+                        dispatch_latency = time.perf_counter() - dispatch_started
+                        _print_backend_latency(response, dispatch_latency)
+                        print(f"Post-speech processing so far: {stt_latency + dispatch_latency:.2f}s")
                         reply = str(response.get("reply") or "").strip()
                         spoken = str(response.get("spoken_reply") or response.get("spoken_ack") or "").strip()
                         print(f"Assistant reply: {reply or '[empty]'}")
