@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Final, Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from google import genai
@@ -27,6 +28,7 @@ DEFAULT_GROQ_MODEL: Final[str] = "llama-3.3-70b-versatile"
 DEFAULT_GEMINI_COOLDOWN_SECONDS: Final[int] = 900
 DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[int] = 45
 GROQ_CHAT_COMPLETIONS_URL: Final[str] = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_HOST: Final[str] = "api.groq.com"
 RECOVERABLE_GEMINI_CODES: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
 
 
@@ -63,6 +65,22 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     except ValueError:
         logger.warning("Invalid %s=%r; using %s", name, raw, default)
         return default
+
+
+def _validate_fixed_groq_endpoint() -> None:
+    """Fail closed if the compile-time Groq endpoint ever stops being exact HTTPS."""
+    parsed = urlsplit(GROQ_CHAT_COMPLETIONS_URL)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != GROQ_API_HOST
+        or parsed.port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/openai/v1/chat/completions"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise LLMConfigurationError("The configured Groq endpoint failed the fixed HTTPS allowlist.")
 
 
 def gemini_model_name() -> str:
@@ -192,6 +210,7 @@ def generate_groq_text(
     if not api_key:
         raise LLMConfigurationError("GROQ_API_KEY is not configured.")
 
+    _validate_fixed_groq_endpoint()
     model = groq_model_name()
     payload = {
         "model": model,
@@ -214,7 +233,12 @@ def generate_groq_text(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=request_timeout_seconds()) as response:
+        # B310 is suppressed only after strict scheme/host/path validation above; the URL is
+        # a compile-time constant and cannot be supplied or redirected by user input here.
+        with urllib.request.urlopen(  # nosec B310
+            request,
+            timeout=request_timeout_seconds(),
+        ) as response:
             body = response.read()
         data = json.loads(body.decode("utf-8"))
         choices = data.get("choices") or []
