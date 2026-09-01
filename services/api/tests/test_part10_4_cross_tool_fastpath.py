@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from services.api.app.cross_tool_fastpath import (
     _build_fast_plan,
+    _synthesize_low_latency,
     execute_read_plan_parallel,
     handle_cross_tool_fast_request,
 )
@@ -15,6 +16,7 @@ from services.api.app.cross_tool_reasoning import (
     PlannedStep,
     StepResult,
 )
+from services.api.app.llm_service import LLMResult, LLMUnavailableError
 from services.api.app.tool_registry import ToolRegistry, ToolSpec
 
 
@@ -103,6 +105,116 @@ class CrossToolFastPathTests(unittest.TestCase):
         with self.assertRaises(CrossToolWriteNotSupportedError):
             execute_read_plan_parallel(plan, registry)
 
+    def _fake_plan_and_steps(self):
+        plan = CrossToolPlan(
+            steps=(
+                PlannedStep(tool="gmail.read", instruction="gmail"),
+                PlannedStep(tool="calendar.read", instruction="calendar"),
+            ),
+            reason="test",
+            source="local_fastpath",
+        )
+        steps = (
+            StepResult(
+                index=1,
+                tool="gmail.read",
+                instruction="gmail",
+                status="success",
+                data={
+                    "count": 1,
+                    "emails": [
+                        {
+                            "sender": "GitHub <noreply@github.com>",
+                            "subject": "Security Gates workflow failed",
+                            "timestamp": "2026-09-01T18:00:00+00:00",
+                            "snippet": "Backend tests and security audit failed.",
+                        }
+                    ],
+                },
+            ),
+            StepResult(
+                index=2,
+                tool="calendar.read",
+                instruction="calendar",
+                status="success",
+                data={"formatted": "Tomorrow is free from 9:00 AM to 6:00 PM."},
+            ),
+        )
+        return plan, steps
+
+    def test_low_latency_synthesis_prefers_configured_groq(self) -> None:
+        plan, steps = self._fake_plan_and_steps()
+        model_result = LLMResult(
+            text=(
+                '{"reply":"Tomorrow is clear. Focus on the failed Security Gates workflow first.",'
+                '"spoken_reply":"Tomorrow is clear. Focus on the failed Security Gates workflow first."}'
+            ),
+            provider="groq",
+            model="llama-3.3-70b-versatile",
+        )
+        with (
+            patch.dict("os.environ", {"GROQ_API_KEY": "test-key"}, clear=False),
+            patch(
+                "services.api.app.cross_tool_fastpath.generate_groq_text",
+                return_value=model_result,
+            ) as groq,
+            patch("services.api.app.cross_tool_fastpath.synthesize_results") as standard,
+        ):
+            reply, spoken, provider = _synthesize_low_latency(
+                "check my calendar and email, then tell me what to focus on first",
+                plan,
+                steps,
+            )
+
+        self.assertEqual(provider, "groq")
+        self.assertIn("Security Gates", reply)
+        self.assertIn("Security Gates", spoken)
+        groq.assert_called_once()
+        standard.assert_not_called()
+
+    def test_low_latency_synthesis_falls_back_to_standard_on_groq_failure(self) -> None:
+        plan, steps = self._fake_plan_and_steps()
+        with (
+            patch.dict("os.environ", {"GROQ_API_KEY": "test-key"}, clear=False),
+            patch(
+                "services.api.app.cross_tool_fastpath.generate_groq_text",
+                side_effect=LLMUnavailableError("forced failure"),
+            ),
+            patch(
+                "services.api.app.cross_tool_fastpath.synthesize_results",
+                return_value=("quality fallback", "quality fallback spoken"),
+            ) as standard,
+        ):
+            reply, spoken, provider = _synthesize_low_latency(
+                "read Gmail and check calendar",
+                plan,
+                steps,
+            )
+
+        self.assertEqual((reply, spoken), ("quality fallback", "quality fallback spoken"))
+        self.assertEqual(provider, "standard_fallback")
+        standard.assert_called_once_with("read Gmail and check calendar", plan, steps)
+
+    def test_low_latency_synthesis_uses_standard_when_groq_is_not_configured(self) -> None:
+        plan, steps = self._fake_plan_and_steps()
+        with (
+            patch.dict("os.environ", {"GROQ_API_KEY": ""}, clear=False),
+            patch(
+                "services.api.app.cross_tool_fastpath.synthesize_results",
+                return_value=("standard", "standard spoken"),
+            ) as standard,
+            patch("services.api.app.cross_tool_fastpath.generate_groq_text") as groq,
+        ):
+            reply, spoken, provider = _synthesize_low_latency(
+                "read Gmail and check calendar",
+                plan,
+                steps,
+            )
+
+        self.assertEqual((reply, spoken, provider), ("standard", "standard spoken", "standard"))
+        standard.assert_called_once()
+        groq.assert_not_called()
+
     def test_handle_fast_request_keeps_synthesis_quality_stage(self) -> None:
         fake_steps = (
             StepResult(
@@ -126,8 +238,8 @@ class CrossToolFastPathTests(unittest.TestCase):
                 return_value=(fake_steps, {"tool_gmail.read_ms": 10.0, "tool_calendar.read_ms": 12.0}),
             ),
             patch(
-                "services.api.app.cross_tool_fastpath.synthesize_results",
-                return_value=("combined answer", "combined spoken answer"),
+                "services.api.app.cross_tool_fastpath._synthesize_low_latency",
+                return_value=("combined answer", "combined spoken answer", "groq"),
             ) as synthesis,
         ):
             result = handle_cross_tool_fast_request("read Gmail and check calendar")
@@ -136,6 +248,7 @@ class CrossToolFastPathTests(unittest.TestCase):
         self.assertEqual(result.spoken_reply, "combined spoken answer")
         self.assertEqual(result.plan.source, "local_fastpath")
         self.assertIn("cross_tool_total_ms", result.timings_ms)
+        self.assertEqual(result.timings_ms["synthesis_groq_fastpath"], 1.0)
         synthesis.assert_called_once()
 
 
