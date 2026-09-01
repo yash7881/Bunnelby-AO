@@ -69,6 +69,7 @@ class ChatResponse(BaseModel):
     spoken_language: Literal["en", "hi"] | None = None
     action_type: str | None = None
     approval: ApprovalResponse | None = None
+    latency_ms: dict[str, float] | None = None
 
 
 class TTSRequest(BaseModel):
