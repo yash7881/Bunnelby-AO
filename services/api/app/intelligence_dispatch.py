@@ -12,6 +12,10 @@ from .orchestrator import OrchestratorResult
 
 logger = logging.getLogger(__name__)
 
+# Keep the established facade symbol so existing tests/extensions can patch the combined
+# handler without depending on which internal implementation serves it.
+handle_cross_tool_request = handle_cross_tool_fast_request
+
 
 def handle_message_result(user_message: str) -> OrchestratorResult:
     """Top-level intelligence facade introduced in Part 9.
@@ -24,7 +28,7 @@ def handle_message_result(user_message: str) -> OrchestratorResult:
         return _legacy_dispatch(user_message)
 
     try:
-        result = handle_cross_tool_fast_request(user_message)
+        result = handle_cross_tool_request(user_message)
     except CrossToolWriteNotSupportedError as exc:
         message = str(exc)
         return OrchestratorResult(
@@ -52,17 +56,21 @@ def handle_message_result(user_message: str) -> OrchestratorResult:
     succeeded = sum(step.status == "success" for step in result.steps)
     failed = len(result.steps) - succeeded
     status_note = f"Cross-tool plan: {succeeded} succeeded, {failed} failed."
+    spoken_metadata: dict[str, object] = {
+        "cross_tool": True,
+        "steps_total": len(result.steps),
+        "steps_succeeded": succeeded,
+        "steps_failed": failed,
+        "plan_source": result.plan.source,
+    }
+    timings = getattr(result, "timings_ms", None)
+    if timings:
+        spoken_metadata["latency_ms"] = dict(timings)
+
     return OrchestratorResult(
         reply=result.reply,
         action_type="task_complete" if succeeded else "error",
         memory_content=f"{result.reply}\n{status_note}",
         spoken_reply=result.spoken_reply,
-        spoken_metadata={
-            "cross_tool": True,
-            "steps_total": len(result.steps),
-            "steps_succeeded": succeeded,
-            "steps_failed": failed,
-            "plan_source": result.plan.source,
-            "latency_ms": dict(result.timings_ms),
-        },
+        spoken_metadata=spoken_metadata,
     )
