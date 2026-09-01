@@ -110,6 +110,9 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     db.add(assistant_message)
     db.commit()
 
+    raw_latency = result.spoken_metadata.get("latency_ms")
+    latency_ms = dict(raw_latency) if isinstance(raw_latency, dict) else None
+
     return ChatResponse(
         reply=result.reply,
         spoken_reply=spoken.text,
@@ -117,6 +120,7 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
         spoken_language=spoken.language,
         action_type=spoken.action_type,
         approval=_approval_response(result.approval),
+        latency_ms=latency_ms,
     )
 
 
