@@ -29,10 +29,25 @@ SAFE_WAKE_FORMS = {
     "hey bundle b",
 }
 
-SILERO_VAD_URL = (
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
-    "asr-models/silero_vad.onnx"
+# Use an immutable upstream Silero revision as the primary bootstrap source.
+# A sherpa-onnx release asset is retained as a fallback. Every downloaded
+# candidate is actually loaded by sherpa-onnx before it is promoted into the
+# Bunnelby runtime model path, so an HTML/error response can never be accepted
+# just because it has a plausible filename.
+SILERO_VAD_SOURCES = (
+    (
+        "Silero upstream pinned model",
+        "https://raw.githubusercontent.com/snakers4/silero-vad/"
+        "867c2aa692646a1f1de3e94a15c9dd9f614c0acb/"
+        "src/silero_vad/data/silero_vad.onnx",
+    ),
+    (
+        "sherpa-onnx V5 release model",
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+        "vad-models/silero_vad_v5.onnx",
+    ),
 )
+MIN_SILERO_MODEL_BYTES = 1_000_000
 
 VAD_THRESHOLD = 0.35
 VAD_MIN_SILENCE_SECONDS = 0.35
@@ -80,30 +95,6 @@ def wake_asr_model_root() -> Path:
     return _runtime_root() / "models" / "wake-asr"
 
 
-def ensure_silero_vad_model() -> Path:
-    target = vad_model_path()
-    if target.is_file() and target.stat().st_size > 1_000_000:
-        return target
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    partial = target.with_suffix(target.suffix + ".part")
-
-    print("Silero VAD model missing; downloading official sherpa-onnx asset once...")
-    try:
-        urllib.request.urlretrieve(SILERO_VAD_URL, partial)
-        if not partial.is_file() or partial.stat().st_size <= 1_000_000:
-            raise RuntimeError("Downloaded Silero VAD model is unexpectedly small.")
-        partial.replace(target)
-    finally:
-        if partial.exists() and not target.exists():
-            try:
-                partial.unlink()
-            except OSError:
-                pass
-
-    return target
-
-
 def create_vad(model_path: Path):
     config = sherpa_onnx.VadModelConfig()
     config.silero_vad.model = str(model_path)
@@ -119,6 +110,79 @@ def create_vad(model_path: Path):
         buffer_size_in_seconds=VAD_BUFFER_SECONDS,
     )
     return detector, int(config.silero_vad.window_size)
+
+
+def _validate_vad_model(candidate: Path) -> None:
+    if not candidate.is_file():
+        raise RuntimeError("Silero VAD candidate file was not created.")
+    size = candidate.stat().st_size
+    if size < MIN_SILERO_MODEL_BYTES:
+        raise RuntimeError(
+            f"Silero VAD candidate is unexpectedly small ({size:,} bytes)."
+        )
+
+    # File-size checks alone can accept HTML/error payloads. Loading the model
+    # through the exact runtime API is the compatibility gate.
+    detector, window_size = create_vad(candidate)
+    if detector is None or window_size <= 0:
+        raise RuntimeError("Silero VAD candidate failed runtime validation.")
+
+
+def ensure_silero_vad_model() -> Path:
+    target = vad_model_path()
+
+    if target.is_file():
+        try:
+            _validate_vad_model(target)
+            return target
+        except Exception as exc:
+            print(f"Existing Silero VAD runtime asset is invalid: {exc}")
+            print("A verified replacement will be downloaded atomically.")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_suffix(target.suffix + ".part")
+    errors: list[str] = []
+
+    for source_name, url in SILERO_VAD_SOURCES:
+        try:
+            if partial.exists():
+                partial.unlink()
+
+            print(f"Downloading Silero VAD from: {source_name}")
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Bunnelby-Wake-Runtime/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=90) as response:
+                with partial.open("wb") as handle:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+
+            _validate_vad_model(partial)
+            partial.replace(target)
+            print(
+                "Silero VAD bootstrap: PASS "
+                f"({target.stat().st_size:,} bytes, runtime validated)"
+            )
+            return target
+        except Exception as exc:
+            errors.append(f"{source_name}: {exc}")
+            print(f"Silero VAD source failed validation: {source_name}: {exc}")
+        finally:
+            if partial.exists():
+                try:
+                    partial.unlink()
+                except OSError:
+                    pass
+
+    detail = "\n  - ".join(errors)
+    raise RuntimeError(
+        "Could not bootstrap a valid Silero VAD model from verified sources."
+        + (f"\n  - {detail}" if detail else "")
+    )
 
 
 def load_wake_asr() -> WhisperModel:
