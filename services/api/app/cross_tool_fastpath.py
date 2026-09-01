@@ -22,8 +22,9 @@ from .cross_tool_reasoning import (
     execute_plan,
     synthesize_results,
 )
+from .gmail_fast_read import gmail_read_fast_executor
 from .llm_service import LLMServiceError, generate_groq_text
-from .tool_registry import ToolRegistry
+from .tool_registry import ToolRegistry, ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,31 @@ def _build_fast_plan(user_message: str) -> CrossToolPlan:
         reason="Typed local fast path for explicit Gmail + Calendar read request.",
         source="local_fastpath",
     )
+
+
+def _build_fast_registry() -> ToolRegistry:
+    """Reuse established tool policy while swapping only Gmail's read transport.
+
+    The batched Gmail executor has the same read-only output contract. Risk and approval
+    metadata are copied from the canonical registry instead of being redefined here, so any
+    future policy tightening automatically disables parallel eligibility through validation.
+    """
+    canonical = build_cross_tool_registry()
+    gmail_spec = canonical.get("gmail.read")
+    calendar_spec = canonical.get("calendar.read")
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name=gmail_spec.name,
+            description=gmail_spec.description,
+            risk_level=gmail_spec.risk_level,
+            requires_approval=gmail_spec.requires_approval,
+            executor=gmail_read_fast_executor,
+        )
+    )
+    registry.register(calendar_spec)
+    return registry
 
 
 def _validate_parallel_read_plan(plan: CrossToolPlan, registry: ToolRegistry) -> None:
@@ -107,7 +133,7 @@ def execute_read_plan_parallel(
     registry: ToolRegistry | None = None,
 ) -> tuple[tuple[StepResult, ...], dict[str, float]]:
     """Execute independent R1 Gmail/Calendar reads concurrently and fail closed otherwise."""
-    active_registry = registry or build_cross_tool_registry()
+    active_registry = registry or _build_fast_registry()
     _validate_parallel_read_plan(plan, active_registry)
 
     results: list[StepResult | None] = [None] * len(plan.steps)
