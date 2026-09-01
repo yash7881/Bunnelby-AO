@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import os
 import platform
 import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from services.api.app.cuda_runtime import (
+    candidate_windows_cuda_dll_directories,
+    configure_windows_cuda_dll_directories,
+)
 
 REQUIRED_DLLS = (
     "cublas64_12.dll",
@@ -13,38 +21,6 @@ REQUIRED_DLLS = (
     "cudnn64_9.dll",
 )
 DEFAULT_COMPUTE_TYPE = "int8_float16"
-
-
-def _candidate_dirs() -> list[Path]:
-    candidates: list[Path] = []
-
-    for raw in os.environ.get("PATH", "").split(os.pathsep):
-        raw = raw.strip().strip('"')
-        if raw:
-            candidates.append(Path(raw))
-
-    site_packages = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
-    if site_packages.is_dir():
-        candidates.extend(site_packages.glob("*/bin"))
-        candidates.extend(site_packages.glob("*/lib"))
-
-    cuda_root = (
-        Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-        / "NVIDIA GPU Computing Toolkit"
-        / "CUDA"
-    )
-    if cuda_root.is_dir():
-        candidates.extend(sorted(cuda_root.glob("v12*/bin"), reverse=True))
-
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for path in candidates:
-        key = str(path).casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(path)
-    return unique
 
 
 def _find_dll(name: str, directories: list[Path]) -> Path | None:
@@ -93,7 +69,13 @@ def run(smoke_model: bool, compute_type: str) -> int:
         print(f"RESULT: FAIL — requested compute type {compute_type!r} is not supported.")
         return 4
 
-    directories = _candidate_dirs()
+    registered = configure_windows_cuda_dll_directories()
+    if registered:
+        print("Registered process-local NVIDIA DLL directories:")
+        for path in registered:
+            print(f"  {path}")
+
+    directories = candidate_windows_cuda_dll_directories()
     print()
     print("Required CUDA/cuDNN DLLs:")
     all_loadable = True
@@ -101,7 +83,7 @@ def run(smoke_model: bool, compute_type: str) -> int:
         path = _find_dll(name, directories)
         loadable, detail = _load_dll(path, name)
         all_loadable = all_loadable and loadable
-        location = str(path) if path else "NOT FOUND in PATH / venv NVIDIA bins / CUDA 12 bins"
+        location = str(path) if path else "NOT FOUND in venv NVIDIA bins / CUDA 12 bins"
         status = "PASS" if loadable else "FAIL"
         print(f"  {name}: {status}")
         print(f"    location: {location}")
@@ -120,6 +102,8 @@ def run(smoke_model: bool, compute_type: str) -> int:
         print()
         print("GPU Whisper smoke test: loading faster-whisper small...")
         from faster_whisper import WhisperModel
+
+        import os
 
         local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
         if local_app_data:
