@@ -74,6 +74,58 @@ class ConversationSTTTests(unittest.TestCase):
                 stt_service.transcribe_samples(samples)
         load_model.assert_not_called()
 
+    def test_native_inference_failure_invalidates_poisoned_model_cache(self) -> None:
+        model = Mock()
+        model.model = Mock()
+
+        def failing_segments():
+            raise RuntimeError("deferred CUDA encoder failure")
+            yield  # pragma: no cover - makes this a generator
+
+        model.transcribe.return_value = (
+            failing_segments(),
+            SimpleNamespace(language="en", language_probability=1.0, duration=1.0),
+        )
+        stt_service._model = model
+        stt_service._model_signature = stt_service._model_config_signature()
+
+        with self.assertRaises(stt_service.STTTranscriptionError):
+            stt_service.transcribe_samples(np.zeros(16_000, dtype=np.float32))
+
+        self.assertIsNone(stt_service._model)
+        self.assertIsNone(stt_service._model_signature)
+        model.model.unload_model.assert_called_once_with()
+
+    def test_successful_inference_keeps_warm_model_cached(self) -> None:
+        model = Mock()
+        model.transcribe.return_value = (
+            iter([SimpleNamespace(text=" ready ")]),
+            SimpleNamespace(language="en", language_probability=1.0, duration=1.0),
+        )
+        stt_service._model = model
+        stt_service._model_signature = stt_service._model_config_signature()
+
+        result = stt_service.transcribe_samples(np.zeros(16_000, dtype=np.float32))
+
+        self.assertEqual(result.text, "ready")
+        self.assertIs(stt_service._model, model)
+
+    def test_runtime_profile_reports_effective_environment(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "STT_MODEL": "small",
+                "STT_DEVICE": "cuda",
+                "STT_COMPUTE_TYPE": "int8_float16",
+                "STT_BEAM_SIZE": "3",
+            },
+        ):
+            profile = stt_service.stt_runtime_profile()
+        self.assertEqual(profile.model, "small")
+        self.assertEqual(profile.device, "cuda")
+        self.assertEqual(profile.compute_type, "int8_float16")
+        self.assertEqual(profile.beam_size, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

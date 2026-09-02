@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from .cuda_runtime import configure_windows_cuda_dll_directories
+from .cuda_runtime import configure_windows_cuda_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,15 @@ class TranscriptionResult:
     language: str
     language_probability: float
     duration_seconds: float
+
+
+@dataclass(frozen=True)
+class STTRuntimeProfile:
+    model: str
+    device: str
+    compute_type: str
+    cpu_threads: int
+    beam_size: int
 
 
 _model_lock = threading.Lock()
@@ -149,6 +158,45 @@ def _model_config_signature() -> tuple[str, str, str, int, str]:
     )
 
 
+def stt_runtime_profile() -> STTRuntimeProfile:
+    """Return the effective configuration used for the next model load/inference."""
+    return STTRuntimeProfile(
+        model=stt_model_name(),
+        device=stt_device(),
+        compute_type=stt_compute_type(),
+        cpu_threads=stt_cpu_threads(),
+        beam_size=stt_beam_size(),
+    )
+
+
+def _invalidate_cached_model(failed_model: Any, reason: str) -> bool:
+    """Remove a model that suffered a native inference failure.
+
+    CTranslate2 failures can leave the Python object alive while its CUDA/native state is
+    unusable. Identity checking prevents one failed call from clearing a newer model that
+    another thread has already installed.
+    """
+    global _model, _model_signature
+
+    invalidated = False
+    with _model_lock:
+        if _model is failed_model:
+            _model = None
+            _model_signature = None
+            invalidated = True
+
+    if invalidated:
+        native_model = getattr(failed_model, "model", None)
+        unload = getattr(native_model, "unload_model", None)
+        if callable(unload):
+            try:
+                unload()
+            except Exception:
+                logger.debug("Could not eagerly unload failed STT native model", exc_info=True)
+        logger.warning("Invalidated failed Bunnelby STT model cache: %s", reason)
+    return invalidated
+
+
 def _load_model() -> Any:
     global _model, _model_signature
 
@@ -161,9 +209,17 @@ def _load_model() -> Any:
             return _model
 
         if stt_device().casefold() == "cuda":
-            added = configure_windows_cuda_dll_directories()
-            if added:
-                logger.info("Registered Bunnelby-local CUDA DLL directories: %s", added)
+            cuda_configuration = configure_windows_cuda_runtime()
+            if cuda_configuration.dll_directories:
+                logger.info(
+                    "Registered Bunnelby-local CUDA DLL directories: %s",
+                    cuda_configuration.dll_directories,
+                )
+            if cuda_configuration.path_directories:
+                logger.info(
+                    "Prepended process-local CUDA PATH directories: %s",
+                    cuda_configuration.path_directories,
+                )
 
         try:
             from faster_whisper import WhisperModel
@@ -255,6 +311,7 @@ def _transcribe_source(
         raise
     except Exception as exc:
         logger.warning("Bunnelby STT inference failed: %s", exc)
+        _invalidate_cached_model(model, str(exc))
         raise STTTranscriptionError("Local speech recognition failed for this audio.") from exc
 
 
@@ -333,7 +390,20 @@ def transcribe_audio(
 
 
 def _reset_model_cache_for_tests() -> None:
+    unload_stt_model()
+
+
+def unload_stt_model() -> None:
+    """Release the current warm STT model for an explicit profile switch/shutdown."""
     global _model, _model_signature
     with _model_lock:
+        model = _model
         _model = None
         _model_signature = None
+    native_model = getattr(model, "model", None)
+    unload = getattr(native_model, "unload_model", None)
+    if callable(unload):
+        try:
+            unload()
+        except Exception:
+            logger.debug("Could not eagerly unload STT model", exc_info=True)
