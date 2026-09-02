@@ -26,6 +26,8 @@ from services.api.app.audio_playback import (
 )
 from services.api.app.stt_service import (
     STTServiceError,
+    TranscriptionResult,
+    stt_hindi_hotwords,
     stt_runtime_profile,
     transcribe_samples,
 )
@@ -81,6 +83,9 @@ DEFAULT_BARGE_IN_MIN_SPEECH_SECONDS = 0.20
 DEFAULT_BARGE_IN_ECHO_THRESHOLD = 0.32
 DEFAULT_BARGE_IN_MIN_RMS = 0.008
 READ_SAMPLES = 512
+_INDIC_RESCUE_LANGUAGE_CODES = frozenset(
+    {"bn", "gu", "kn", "ml", "mr", "pa", "ta", "te", "ur"}
+)
 
 
 def _sounddevice():
@@ -178,6 +183,31 @@ def _read_microphone(stream, window_size: int) -> tuple[np.ndarray, bool]:
     return np.asarray(samples, dtype=np.float32).reshape(-1), bool(overflowed)
 
 
+def _discard_buffered_microphone(stream) -> int:
+    """Discard frames captured before a new interpretation state begins.
+
+    PortAudio keeps filling the one persistent input stream while wake ASR, STT, backend,
+    or an interactive benchmark prompt runs. A snapshot prevents old speech from becoming
+    the first utterance in the next state while avoiding an open-ended drain that could
+    chase newly arriving live audio forever.
+    """
+    try:
+        available = int(getattr(stream, "read_available", 0))
+    except (TypeError, ValueError, OSError):
+        return 0
+    remaining = max(0, min(available, SAMPLE_RATE * 120))
+    discarded = 0
+    while remaining:
+        frame_count = min(remaining, SAMPLE_RATE)
+        try:
+            stream.read(frame_count)
+        except (OSError, RuntimeError):
+            break
+        discarded += frame_count
+        remaining -= frame_count
+    return discarded
+
+
 def _pop_segments(vad) -> list[np.ndarray]:
     segments: list[np.ndarray] = []
     while not vad.empty():
@@ -189,6 +219,9 @@ def _pop_segments(vad) -> list[np.ndarray]:
 
 
 def wait_for_wake(stream, model_path: Path, wake_model, args, stats: RuntimeStats):
+    discarded = _discard_buffered_microphone(stream)
+    if discarded:
+        print(f"Discarded {discarded / SAMPLE_RATE:.2f}s of pre-standby microphone buffer")
     wake_vad, window_size = create_vad(model_path)
     pending = np.empty(0, dtype=np.float32)
 
@@ -238,6 +271,10 @@ def capture_conversation_turn(
 
     if initial_samples is not None and initial_samples.size:
         pending = _feed_vad(vad, window_size, pending, initial_samples)
+    else:
+        discarded = _discard_buffered_microphone(stream)
+        if discarded:
+            print(f"Discarded {discarded / SAMPLE_RATE:.2f}s of pre-listening microphone buffer")
 
     while True:
         samples, overflowed = _read_microphone(stream, window_size)
@@ -425,6 +462,57 @@ def _emit_metrics(metrics: TurnMetrics) -> None:
     print("BUNNELBY_TURN_METRICS " + json.dumps(rounded, separators=(",", ":")))
 
 
+def _devanagari_count(text: str) -> int:
+    return sum("\u0900" <= character <= "\u097f" for character in text)
+
+
+def _needs_hindi_rescue(result: TranscriptionResult, language_mode: str) -> bool:
+    if language_mode != "auto" or result.language == "hi" or not result.text.strip():
+        return False
+    if _devanagari_count(result.text) >= 2 and result.language_probability < 0.75:
+        return True
+    return (
+        result.language in _INDIC_RESCUE_LANGUAGE_CODES
+        and result.language_probability < 0.50
+    )
+
+
+def _prefer_hindi_rescue(
+    automatic: TranscriptionResult,
+    hindi: TranscriptionResult,
+) -> bool:
+    if not hindi.text.strip() or hindi.language != "hi":
+        return False
+    if hindi.language_probability <= automatic.language_probability:
+        return False
+    return _devanagari_count(hindi.text) >= _devanagari_count(automatic.text)
+
+
+def _transcribe_conversation(samples: np.ndarray, language_mode: str) -> TranscriptionResult:
+    automatic = transcribe_samples(
+        samples,
+        sample_rate=SAMPLE_RATE,
+        language=language_mode,
+    )
+    if not _needs_hindi_rescue(automatic, language_mode):
+        return automatic
+
+    print(
+        "Low-confidence Indic auto-detection; running one bounded Hindi rescue inference."
+    )
+    hindi = transcribe_samples(
+        samples,
+        sample_rate=SAMPLE_RATE,
+        language="hi",
+        hotwords_override=stt_hindi_hotwords(),
+    )
+    if _prefer_hindi_rescue(automatic, hindi):
+        print("Hindi rescue selected by language-confidence/script policy.")
+        return hindi
+    print("Hindi rescue rejected; retaining the original auto transcript.")
+    return automatic
+
+
 def _env_follow_up_seconds() -> float:
     raw = os.getenv("FOLLOW_UP_SECONDS", "").strip()
     if not raw:
@@ -464,7 +552,7 @@ def run(args: argparse.Namespace) -> int:
         "Conversation STT: "
         f"model={stt_profile.model} device={stt_profile.device} "
         f"compute={stt_profile.compute_type} beam={stt_profile.beam_size} "
-        f"language={args.language}"
+        f"language={args.language} context={'enabled' if stt_profile.hotwords else 'disabled'}"
     )
     print(
         f"TTS: enabled={'YES' if args.tts else 'NO'} provider={preferred_provider()} "
@@ -565,11 +653,7 @@ def run(args: argparse.Namespace) -> int:
 
                 try:
                     stt_started = time.perf_counter()
-                    result = transcribe_samples(
-                        next_audio.samples,
-                        sample_rate=SAMPLE_RATE,
-                        language=args.language,
-                    )
+                    result = _transcribe_conversation(next_audio.samples, args.language)
                     metrics.stt_ms = (time.perf_counter() - stt_started) * 1000.0
                 except STTServiceError as exc:
                     stats.stt_failures += 1

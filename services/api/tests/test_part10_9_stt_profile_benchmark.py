@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.wakeword.stt_profile_benchmark import BenchmarkResult, select_profile, word_error_rate
+from scripts.wakeword.stt_profile_benchmark import (
+    BenchmarkResult,
+    select_context_policy,
+    select_profile,
+    word_error_rate,
+)
 
 
 def _result(identifier: str, latency: float, error_rate: float) -> BenchmarkResult:
@@ -31,6 +36,14 @@ class STTProfileBenchmarkTests(unittest.TestCase):
         gpu = [_result("a", 0.5, 0.16), _result("b", 0.8, 0.16)]
 
         self.assertEqual(select_profile(cpu, gpu), "CPU/int8")
+
+    def test_context_requires_mean_improvement_without_large_prompt_regression(self) -> None:
+        baseline = [_result("a", 0.5, 1.0), _result("b", 0.5, 0.5)]
+        improved = [_result("a", 0.5, 0.5), _result("b", 0.5, 0.5)]
+        regressed = [_result("a", 0.5, 0.0), _result("b", 0.5, 1.0)]
+
+        self.assertEqual(select_context_policy(improved, baseline), "enabled")
+        self.assertEqual(select_context_policy(regressed, baseline), "disabled")
 
 
 if __name__ == "__main__":

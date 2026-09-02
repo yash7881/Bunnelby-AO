@@ -28,6 +28,7 @@ class ConversationSTTTests(unittest.TestCase):
         samples = np.zeros(16_000 * 9, dtype=np.float32)
 
         with (
+            patch.dict(os.environ, {"STT_HOTWORDS": ""}),
             patch.object(stt_service, "_load_model", return_value=model),
             patch("services.api.app.stt_service.tempfile.NamedTemporaryFile") as named_temp,
         ):
@@ -44,6 +45,7 @@ class ConversationSTTTests(unittest.TestCase):
         self.assertFalse(kwargs["vad_filter"])
         self.assertFalse(kwargs["condition_on_previous_text"])
         self.assertIsNone(kwargs["language"])
+        self.assertIsNone(kwargs["hotwords"])
         waveform = model.transcribe.call_args.args[0]
         self.assertIsInstance(waveform, np.ndarray)
         self.assertTrue(waveform.flags["C_CONTIGUOUS"])
@@ -118,6 +120,7 @@ class ConversationSTTTests(unittest.TestCase):
                 "STT_DEVICE": "cuda",
                 "STT_COMPUTE_TYPE": "int8_float16",
                 "STT_BEAM_SIZE": "3",
+                "STT_HOTWORDS": "Bunnelby   Gmail calendar",
             },
         ):
             profile = stt_service.stt_runtime_profile()
@@ -125,6 +128,40 @@ class ConversationSTTTests(unittest.TestCase):
         self.assertEqual(profile.device, "cuda")
         self.assertEqual(profile.compute_type, "int8_float16")
         self.assertEqual(profile.beam_size, 3)
+        self.assertEqual(profile.hotwords, "Bunnelby Gmail calendar")
+
+    def test_optional_hotwords_are_decoder_context_not_transcript_rewriting(self) -> None:
+        model = Mock()
+        model.transcribe.return_value = (
+            iter([SimpleNamespace(text=" unread email ")]),
+            SimpleNamespace(language="en", language_probability=1.0, duration=1.0),
+        )
+        with (
+            patch.dict(os.environ, {"STT_HOTWORDS": "Gmail calendar unread"}),
+            patch.object(stt_service, "_load_model", return_value=model),
+        ):
+            result = stt_service.transcribe_samples(np.zeros(16_000, dtype=np.float32))
+
+        self.assertEqual(result.text, "unread email")
+        self.assertEqual(model.transcribe.call_args.kwargs["hotwords"], "Gmail calendar unread")
+
+    def test_per_call_context_override_is_forwarded_without_changing_global_config(self) -> None:
+        model = Mock()
+        model.transcribe.return_value = (
+            iter([SimpleNamespace(text=" कल का कैलेंडर ")]),
+            SimpleNamespace(language="hi", language_probability=1.0, duration=1.0),
+        )
+        with (
+            patch.dict(os.environ, {"STT_HOTWORDS": "English context"}),
+            patch.object(stt_service, "_load_model", return_value=model),
+        ):
+            stt_service.transcribe_samples(
+                np.zeros(16_000, dtype=np.float32),
+                language="hi",
+                hotwords_override="कल कैलेंडर",
+            )
+
+        self.assertEqual(model.transcribe.call_args.kwargs["hotwords"], "कल कैलेंडर")
 
 
 if __name__ == "__main__":

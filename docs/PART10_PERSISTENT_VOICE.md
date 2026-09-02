@@ -19,6 +19,12 @@ gate compares microphone frames with recently played TTS audio before accepting 
 barge-in. This is an echo rejection heuristic, not a claim of acoustic echo
 cancellation, so barge-in remains a mandatory real-laptop acceptance test.
 
+The microphone stream remains single-owner and persistent. Before STANDBY or a fresh
+LISTENING state begins, the runtime snapshots and discards only PortAudio frames that
+were buffered during the preceding ASR/backend state. This prevents stale speech from
+being executed as the next command without chasing or deleting newly arriving live
+audio.
+
 ## Timing contract
 
 `FOLLOW_UP_SECONDS` defaults to `10`. The deadline uses `time.monotonic()` and is
@@ -43,6 +49,8 @@ STT_DEVICE=cpu
 STT_COMPUTE_TYPE=int8
 STT_CPU_THREADS=4
 STT_BEAM_SIZE=5
+STT_HOTWORDS=
+STT_HOTWORDS_HI=कल कैलेंडर चेक करो ईमेल जीमेल आज कल परसों
 FOLLOW_UP_SECONDS=10
 TTS_ENABLED=true
 EDGE_TTS_ENABLED=true
@@ -76,6 +84,12 @@ both profiles with the same `small` model and beam size 5:
 The benchmark recommends GPU only when its median is at least 15 percent faster and
 its mean word error rate is no more than 0.05 worse. An incomplete GPU comparison
 fails closed to CPU/int8.
+
+Production language mode remains `auto`. A normal result is used directly. Only a
+low-confidence unsupported Indic detection, or Devanagari text mislabeled as another
+language, causes one retry with a Hindi hint and measured Hindi decoder context. The
+retry is selected only when its Hindi confidence and Devanagari evidence are stronger;
+there is no phrase replacement or transcript rewriting.
 
 With the FastAPI backend running on port 8000, start the persistent runtime:
 

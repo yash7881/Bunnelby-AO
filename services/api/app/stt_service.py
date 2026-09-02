@@ -19,6 +19,8 @@ DEFAULT_STT_DEVICE = "cpu"
 DEFAULT_STT_COMPUTE_TYPE = "int8"
 DEFAULT_STT_CPU_THREADS = 4
 DEFAULT_STT_BEAM_SIZE = 5
+DEFAULT_STT_HOTWORDS = ""
+DEFAULT_STT_HINDI_HOTWORDS = "कल कैलेंडर चेक करो ईमेल जीमेल आज कल परसों"
 DEFAULT_STT_MAX_AUDIO_BYTES = 12 * 1024 * 1024
 DEFAULT_STT_MAX_SAMPLE_SECONDS = 120.0
 STT_SAMPLE_RATE = 16_000
@@ -72,6 +74,7 @@ class STTRuntimeProfile:
     compute_type: str
     cpu_threads: int
     beam_size: int
+    hotwords: str | None
 
 
 _model_lock = threading.Lock()
@@ -120,6 +123,19 @@ def stt_beam_size() -> int:
     return max(1, min(value, 10))
 
 
+def stt_hotwords() -> str | None:
+    """Return bounded, optional decoder context without rewriting any transcript."""
+    normalized = " ".join(os.getenv("STT_HOTWORDS", DEFAULT_STT_HOTWORDS).split())
+    return normalized[:300] or None
+
+
+def stt_hindi_hotwords() -> str:
+    normalized = " ".join(
+        os.getenv("STT_HOTWORDS_HI", DEFAULT_STT_HINDI_HOTWORDS).split()
+    )
+    return (normalized[:300] or DEFAULT_STT_HINDI_HOTWORDS)
+
+
 def stt_max_audio_bytes() -> int:
     raw = os.getenv("STT_MAX_AUDIO_BYTES", str(DEFAULT_STT_MAX_AUDIO_BYTES)).strip()
     try:
@@ -166,6 +182,7 @@ def stt_runtime_profile() -> STTRuntimeProfile:
         compute_type=stt_compute_type(),
         cpu_threads=stt_cpu_threads(),
         beam_size=stt_beam_size(),
+        hotwords=stt_hotwords(),
     )
 
 
@@ -291,6 +308,7 @@ def _transcribe_source(
     *,
     language_hint: str,
     vad_filter: bool,
+    hotwords_override: str | None = None,
 ) -> TranscriptionResult:
     model = _load_model()
     try:
@@ -302,6 +320,7 @@ def _transcribe_source(
             "condition_on_previous_text": False,
             "vad_filter": vad_filter,
             "word_timestamps": False,
+            "hotwords": hotwords_override if hotwords_override is not None else stt_hotwords(),
         }
         if vad_filter:
             kwargs["vad_parameters"] = {"min_silence_duration_ms": 350}
@@ -320,6 +339,7 @@ def transcribe_samples(
     *,
     sample_rate: int = STT_SAMPLE_RATE,
     language: str | None = "auto",
+    hotwords_override: str | None = None,
 ) -> TranscriptionResult:
     """Transcribe a microphone utterance directly from RAM.
 
@@ -347,6 +367,7 @@ def transcribe_samples(
         np.ascontiguousarray(waveform),
         language_hint=language_hint,
         vad_filter=False,
+        hotwords_override=hotwords_override,
     )
 
 

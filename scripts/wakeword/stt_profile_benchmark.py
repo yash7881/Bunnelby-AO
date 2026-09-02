@@ -59,9 +59,12 @@ PROMPTS = (
     ),
 )
 
+BENCHMARK_HOTWORDS = "Bunnelby Gmail calendar latest unread email emails"
+
 PROFILES = (
-    ("CPU/int8", "cpu", "int8"),
-    ("GPU/int8_float16", "cuda", "int8_float16"),
+    ("CPU/int8+context", "cpu", "int8", BENCHMARK_HOTWORDS),
+    ("GPU/int8_float16+context", "cuda", "int8_float16", BENCHMARK_HOTWORDS),
+    ("GPU/int8_float16+no-context", "cuda", "int8_float16", ""),
 )
 
 
@@ -111,9 +114,33 @@ def select_profile(
     return "CPU/int8"
 
 
+def select_context_policy(
+    contextual: list[BenchmarkResult],
+    baseline: list[BenchmarkResult],
+) -> str:
+    """Enable context only when the same corpus improves mean WER without a bad outlier."""
+    if not contextual or len(contextual) != len(baseline):
+        return "disabled"
+    contextual_mean = statistics.fmean(result.word_error_rate for result in contextual)
+    baseline_mean = statistics.fmean(result.word_error_rate for result in baseline)
+    worst_regression = max(
+        context.word_error_rate - plain.word_error_rate
+        for context, plain in zip(contextual, baseline, strict=True)
+    )
+    if contextual_mean < baseline_mean and worst_regression <= 0.25:
+        return "enabled"
+    return "disabled"
+
+
 @contextmanager
-def _stt_profile(device: str, compute_type: str):
-    names = ("STT_MODEL", "STT_DEVICE", "STT_COMPUTE_TYPE", "STT_BEAM_SIZE")
+def _stt_profile(device: str, compute_type: str, hotwords: str):
+    names = (
+        "STT_MODEL",
+        "STT_DEVICE",
+        "STT_COMPUTE_TYPE",
+        "STT_BEAM_SIZE",
+        "STT_HOTWORDS",
+    )
     previous = {name: os.environ.get(name) for name in names}
     os.environ.update(
         {
@@ -121,6 +148,7 @@ def _stt_profile(device: str, compute_type: str):
             "STT_DEVICE": device,
             "STT_COMPUTE_TYPE": compute_type,
             "STT_BEAM_SIZE": "5",
+            "STT_HOTWORDS": hotwords,
         }
     )
     unload_stt_model()
@@ -139,11 +167,12 @@ def _benchmark_profile(
     label: str,
     device: str,
     compute_type: str,
+    hotwords: str,
     corpus: list[tuple[BenchmarkPrompt, np.ndarray]],
 ) -> list[BenchmarkResult]:
     print()
     print(f"PROFILE: {label} | model=small | beam=5")
-    with _stt_profile(device, compute_type):
+    with _stt_profile(device, compute_type, hotwords):
         warm_started = time.perf_counter()
         transcribe_samples(
             np.zeros(SAMPLE_RATE, dtype=np.float32),
@@ -224,12 +253,13 @@ def main() -> int:
                 print(f"Captured {captured.speech_seconds:.2f}s in RAM")
 
         all_results: dict[str, list[BenchmarkResult]] = {}
-        for label, device_name, compute_type in PROFILES:
+        for label, device_name, compute_type, hotwords in PROFILES:
             try:
                 all_results[label] = _benchmark_profile(
                     label,
                     device_name,
                     compute_type,
+                    hotwords,
                     corpus,
                 )
             except Exception as exc:
@@ -247,12 +277,20 @@ def main() -> int:
 
         if len(all_results) == len(PROFILES):
             selected = select_profile(
-                all_results["CPU/int8"],
-                all_results["GPU/int8_float16"],
+                all_results["CPU/int8+context"],
+                all_results["GPU/int8_float16+context"],
             )
             print(f"MEASURED PROFILE RECOMMENDATION: {selected}")
+            context_policy = select_context_policy(
+                all_results["GPU/int8_float16+context"],
+                all_results["GPU/int8_float16+no-context"],
+            )
+            print(f"MEASURED CONTEXT RECOMMENDATION: {context_policy}")
+            if context_policy == "enabled":
+                print(f"STT_HOTWORDS={BENCHMARK_HOTWORDS}")
         else:
             print("MEASURED PROFILE RECOMMENDATION: CPU/int8 (GPU corpus gate incomplete)")
+            print("MEASURED CONTEXT RECOMMENDATION: disabled (comparison incomplete)")
         print("Audio storage: RAM ONLY; captured corpus released at process exit")
         return 0
     except KeyboardInterrupt:

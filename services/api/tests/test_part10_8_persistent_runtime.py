@@ -79,6 +79,67 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
         )
         self.assertEqual(args.tts_url, "http://127.0.0.1:9000/tts")
 
+    def test_state_boundary_discards_only_the_buffer_snapshot(self) -> None:
+        class BufferedInput:
+            read_available = 20_000
+
+            def __init__(self) -> None:
+                self.read_sizes: list[int] = []
+
+            def read(self, frames: int):
+                self.read_sizes.append(frames)
+                return np.zeros((frames, 1), dtype=np.float32), False
+
+        stream = BufferedInput()
+        discarded = wake_conversation_runtime._discard_buffered_microphone(stream)
+
+        self.assertEqual(discarded, 20_000)
+        self.assertEqual(stream.read_sizes, [16_000, 4_000])
+
+    def test_low_confidence_indic_auto_result_uses_stronger_hindi_rescue(self) -> None:
+        automatic = TranscriptionResult("Kolka calendar checker", "te", 0.36, 2.0)
+        hindi = TranscriptionResult("कल का कैलेंडर चेक करो", "hi", 1.0, 2.0)
+        samples = np.zeros(16_000, dtype=np.float32)
+
+        with (
+            patch.object(
+                wake_conversation_runtime,
+                "transcribe_samples",
+                side_effect=[automatic, hindi],
+            ) as transcribe,
+            patch.object(
+                wake_conversation_runtime,
+                "stt_hindi_hotwords",
+                return_value="कल कैलेंडर",
+            ),
+        ):
+            selected = wake_conversation_runtime._transcribe_conversation(samples, "auto")
+
+        self.assertEqual(selected, hindi)
+        self.assertEqual(transcribe.call_count, 2)
+        self.assertEqual(transcribe.call_args_list[1].kwargs["language"], "hi")
+        self.assertEqual(
+            transcribe.call_args_list[1].kwargs["hotwords_override"],
+            "कल कैलेंडर",
+        )
+
+    def test_normal_english_auto_result_does_not_retry(self) -> None:
+        english = TranscriptionResult(
+            "Check tomorrow's calendar", "en", 0.62, 2.0
+        )
+        with patch.object(
+            wake_conversation_runtime,
+            "transcribe_samples",
+            return_value=english,
+        ) as transcribe:
+            selected = wake_conversation_runtime._transcribe_conversation(
+                np.zeros(16_000, dtype=np.float32),
+                "auto",
+            )
+
+        self.assertEqual(selected, english)
+        transcribe.assert_called_once()
+
     def test_microphone_runtime_has_no_audio_file_persistence_path(self) -> None:
         source = inspect.getsource(wake_conversation_runtime)
         self.assertNotIn("NamedTemporaryFile", source)
@@ -162,7 +223,11 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
                 wake_conversation_runtime,
                 "stt_runtime_profile",
                 return_value=SimpleNamespace(
-                    model="small", device="cpu", compute_type="int8", beam_size=5
+                    model="small",
+                    device="cpu",
+                    compute_type="int8",
+                    beam_size=5,
+                    hotwords=None,
                 ),
             ),
             patch("sys.stdout", output),
@@ -203,7 +268,7 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
             patch.object(wake_conversation_runtime, "capture_conversation_turn", side_effect=[audio, audio]),
             patch.object(wake_conversation_runtime, "transcribe_samples", side_effect=[STTTranscriptionError("forced"), transcript]),
             patch.object(wake_conversation_runtime, "dispatch_to_chat", return_value=response),
-            patch.object(wake_conversation_runtime, "stt_runtime_profile", return_value=SimpleNamespace(model="small", device="cpu", compute_type="int8", beam_size=5)),
+            patch.object(wake_conversation_runtime, "stt_runtime_profile", return_value=SimpleNamespace(model="small", device="cpu", compute_type="int8", beam_size=5, hotwords=None)),
             patch("sys.stdout", output),
         ):
             exit_code = wake_conversation_runtime.run(args)
@@ -237,7 +302,7 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
             patch.object(wake_conversation_runtime, "capture_conversation_turn", side_effect=[audio, audio]),
             patch.object(wake_conversation_runtime, "transcribe_samples", return_value=transcript),
             patch.object(wake_conversation_runtime, "dispatch_to_chat", side_effect=[RuntimeError("offline"), response]),
-            patch.object(wake_conversation_runtime, "stt_runtime_profile", return_value=SimpleNamespace(model="small", device="cpu", compute_type="int8", beam_size=5)),
+            patch.object(wake_conversation_runtime, "stt_runtime_profile", return_value=SimpleNamespace(model="small", device="cpu", compute_type="int8", beam_size=5, hotwords=None)),
             patch("sys.stdout", output),
         ):
             exit_code = wake_conversation_runtime.run(args)
@@ -262,7 +327,7 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
                     InputStream=Mock(side_effect=OSError("device unavailable"))
                 ),
             ),
-            patch.object(wake_conversation_runtime, "stt_runtime_profile", return_value=SimpleNamespace(model="small", device="cpu", compute_type="int8", beam_size=5)),
+            patch.object(wake_conversation_runtime, "stt_runtime_profile", return_value=SimpleNamespace(model="small", device="cpu", compute_type="int8", beam_size=5, hotwords=None)),
             patch("sys.stdout", output),
         ):
             exit_code = wake_conversation_runtime.run(args)
