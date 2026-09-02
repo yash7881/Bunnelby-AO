@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
 import sherpa_onnx
 from faster_whisper import WhisperModel
 
@@ -18,6 +17,15 @@ SAMPLE_RATE = 16_000
 READ_SECONDS = 0.10
 WAKE_ASR_MODEL = "base.en"
 WAKE_HOTWORDS = "Hey Bunnelby Bonilby Bonnellby"
+
+
+def _sounddevice():
+    """Import PortAudio only at the real microphone boundary, not during CI imports."""
+    try:
+        import sounddevice
+    except Exception as exc:
+        raise RuntimeError("sounddevice/PortAudio is unavailable for live microphone use.") from exc
+    return sounddevice
 
 # Safe acoustic variants observed in the user's real recordings.
 # Deliberately excludes bare "Bunnelby" and common phrases such as
@@ -223,6 +231,7 @@ def transcribe_candidate(model: WhisperModel, audio: np.ndarray) -> tuple[str, f
 
 
 def default_microphone(device_index: int | None):
+    sd = _sounddevice()
     devices = sd.query_devices()
     if len(devices) == 0:
         raise RuntimeError("No audio devices detected by PortAudio.")
@@ -319,6 +328,7 @@ def run_listener(args: argparse.Namespace) -> int:
     last_wake_time = -1e9
 
     try:
+        sd = _sounddevice()
         with sd.InputStream(
             device=device_index,
             channels=1,

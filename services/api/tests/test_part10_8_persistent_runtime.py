@@ -10,7 +10,11 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from scripts.wakeword import always_on_wake_listener, wake_conversation_runtime
+from scripts.wakeword import (
+    always_on_wake_listener,
+    stt_profile_benchmark,
+    wake_conversation_runtime,
+)
 from services.api.app.audio_playback import PlaybackResult, PlaybackStatus
 from services.api.app.stt_service import TranscriptionResult
 from services.api.app.stt_service import STTTranscriptionError
@@ -81,6 +85,15 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
         self.assertNotIn("soundfile.write", source)
         self.assertNotIn("wave.open", source)
 
+    def test_live_audio_dependency_is_not_imported_at_module_load_time(self) -> None:
+        modules = (
+            always_on_wake_listener,
+            stt_profile_benchmark,
+            wake_conversation_runtime,
+        )
+        for module in modules:
+            self.assertNotIn("\nimport sounddevice", inspect.getsource(module))
+
     def test_complete_two_turn_session_uses_one_wake_and_one_follow_up(self) -> None:
         args = wake_conversation_runtime.parse_args(["--turns", "2"])
         now = time.monotonic()
@@ -121,7 +134,11 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
                 "default_microphone",
                 return_value=(1, {"name": "test mic"}),
             ),
-            patch.object(wake_conversation_runtime.sd, "InputStream", return_value=input_context),
+            patch.object(
+                wake_conversation_runtime,
+                "_sounddevice",
+                return_value=SimpleNamespace(InputStream=Mock(return_value=input_context)),
+            ),
             patch.object(
                 wake_conversation_runtime,
                 "wait_for_wake",
@@ -177,7 +194,11 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
             patch.object(wake_conversation_runtime, "ensure_silero_vad_model", return_value=Mock()),
             patch.object(wake_conversation_runtime, "load_wake_asr", return_value=Mock()),
             patch.object(wake_conversation_runtime, "default_microphone", return_value=(1, {"name": "test mic"})),
-            patch.object(wake_conversation_runtime.sd, "InputStream", return_value=input_context),
+            patch.object(
+                wake_conversation_runtime,
+                "_sounddevice",
+                return_value=SimpleNamespace(InputStream=Mock(return_value=input_context)),
+            ),
             patch.object(wake_conversation_runtime, "wait_for_wake", side_effect=[("Hey Bunnelby", 0.2), ("Hey Bunnelby", 0.2)]) as wake,
             patch.object(wake_conversation_runtime, "capture_conversation_turn", side_effect=[audio, audio]),
             patch.object(wake_conversation_runtime, "transcribe_samples", side_effect=[STTTranscriptionError("forced"), transcript]),
@@ -207,7 +228,11 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
             patch.object(wake_conversation_runtime, "ensure_silero_vad_model", return_value=Mock()),
             patch.object(wake_conversation_runtime, "load_wake_asr", return_value=Mock()),
             patch.object(wake_conversation_runtime, "default_microphone", return_value=(1, {"name": "test mic"})),
-            patch.object(wake_conversation_runtime.sd, "InputStream", return_value=input_context),
+            patch.object(
+                wake_conversation_runtime,
+                "_sounddevice",
+                return_value=SimpleNamespace(InputStream=Mock(return_value=input_context)),
+            ),
             patch.object(wake_conversation_runtime, "wait_for_wake", side_effect=[("Hey Bunnelby", 0.2), ("Hey Bunnelby", 0.2)]) as wake,
             patch.object(wake_conversation_runtime, "capture_conversation_turn", side_effect=[audio, audio]),
             patch.object(wake_conversation_runtime, "transcribe_samples", return_value=transcript),
@@ -230,7 +255,13 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
             patch.object(wake_conversation_runtime, "ensure_silero_vad_model", return_value=Mock()),
             patch.object(wake_conversation_runtime, "load_wake_asr", return_value=Mock()),
             patch.object(wake_conversation_runtime, "default_microphone", return_value=(1, {"name": "test mic"})),
-            patch.object(wake_conversation_runtime.sd, "InputStream", side_effect=OSError("device unavailable")),
+            patch.object(
+                wake_conversation_runtime,
+                "_sounddevice",
+                return_value=SimpleNamespace(
+                    InputStream=Mock(side_effect=OSError("device unavailable"))
+                ),
+            ),
             patch.object(wake_conversation_runtime, "stt_runtime_profile", return_value=SimpleNamespace(model="small", device="cpu", compute_type="int8", beam_size=5)),
             patch("sys.stdout", output),
         ):

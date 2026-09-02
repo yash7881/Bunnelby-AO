@@ -12,7 +12,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-import sounddevice as sd
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -64,6 +63,15 @@ PROFILES = (
     ("CPU/int8", "cpu", "int8"),
     ("GPU/int8_float16", "cuda", "int8_float16"),
 )
+
+
+def _sounddevice():
+    """Import PortAudio only for a live benchmark, not while CI imports helpers."""
+    try:
+        import sounddevice
+    except Exception as exc:
+        raise RuntimeError("sounddevice/PortAudio is unavailable for live microphone use.") from exc
+    return sounddevice
 
 
 def _tokens(text: str) -> list[str]:
@@ -188,6 +196,7 @@ def main() -> int:
 
     corpus: list[tuple[BenchmarkPrompt, np.ndarray]] = []
     try:
+        sd = _sounddevice()
         with sd.InputStream(
             device=device_index,
             channels=1,

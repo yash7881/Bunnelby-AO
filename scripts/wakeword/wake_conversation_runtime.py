@@ -12,7 +12,6 @@ from pathlib import Path
 
 import numpy as np
 import sherpa_onnx
-import sounddevice as sd
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -82,6 +81,15 @@ DEFAULT_BARGE_IN_MIN_SPEECH_SECONDS = 0.20
 DEFAULT_BARGE_IN_ECHO_THRESHOLD = 0.32
 DEFAULT_BARGE_IN_MIN_RMS = 0.008
 READ_SAMPLES = 512
+
+
+def _sounddevice():
+    """Import PortAudio only when opening the real microphone."""
+    try:
+        import sounddevice
+    except Exception as exc:
+        raise RuntimeError("sounddevice/PortAudio is unavailable for live microphone use.") from exc
+    return sounddevice
 
 
 @dataclass
@@ -477,6 +485,7 @@ def run(args: argparse.Namespace) -> int:
     exit_code = 0
 
     try:
+        sd = _sounddevice()
         with sd.InputStream(
             device=device_index,
             channels=1,
