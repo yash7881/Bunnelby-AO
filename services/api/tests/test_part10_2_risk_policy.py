@@ -132,6 +132,7 @@ class RegisteredCapabilityPolicyTests(unittest.TestCase):
         "gmail_read": (RiskLevel.L0_OBSERVE, False),
         "calendar_read": (RiskLevel.L0_OBSERVE, False),
         "cross_tool_read": (RiskLevel.L0_OBSERVE, False),
+        "file_search": (RiskLevel.L0_OBSERVE, False),
         "gmail_compose": (RiskLevel.L3_EXTERNAL_WRITE, True),
         "gmail_reply": (RiskLevel.L3_EXTERNAL_WRITE, True),
         "calendar_create": (RiskLevel.L3_EXTERNAL_WRITE, True),

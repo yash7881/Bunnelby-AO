@@ -254,7 +254,7 @@ def _turn_relevance(query_terms: set[str], turn: MemoryTurn) -> float:
 
 
 _TOOL_MEMORY_ROUTES: Final[frozenset[str]] = frozenset(
-    {"gmail", "calendar", "cross_tool"}
+    {"gmail", "calendar", "cross_tool", "file_search"}
 )
 
 
@@ -305,7 +305,7 @@ _COLLECTION_FOLLOW_UP_PATTERN: Final[re.Pattern[str]] = re.compile(
 
 _TOOL_MEMORY_CUE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\b(?:gmail|e-?mail|mail|inbox|calendar|agenda|meeting|"
-    r"schedule|event|availability)\b",
+    r"schedule|event|availability|file|document|folder|local\s+search)\b",
     re.IGNORECASE,
 )
 

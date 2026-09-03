@@ -34,6 +34,7 @@ BrainTool = Literal[
     "calendar_read",
     "calendar_create",
     "cross_tool_read",
+    "file_search",
 ]
 
 # Writes must fail closed to clarification on low confidence or missing arguments.
@@ -47,6 +48,7 @@ _ALLOWED_TOOLS: Final[frozenset[str]] = frozenset(
         "calendar_read",
         "calendar_create",
         "cross_tool_read",
+        "file_search",
     }
 )
 _REQUIRED_ARGS_FOR_TOOL: Final[Mapping[str, tuple[str, ...]]] = {
@@ -100,8 +102,8 @@ BRAIN_SYSTEM_INSTRUCTION: Final[str] = (
 ADDITIONAL ROUTING RESPONSIBILITY:
 You are also Bunnelby's single semantic decision layer for this turn. In addition to the
 reply/spoken_reply persona rules above, decide whether this turn is ordinary conversation,
-needs clarification, or is an explicit request to read or write the user's REAL personal
-Gmail or Google Calendar data.
+needs clarification, or is an explicit request to use the user's REAL personal Gmail,
+Google Calendar, or approved local-file index.
 
 Default to normal conversation ("answer"). The mere presence of words like "email",
 "gmail", "calendar", "meeting", or "schedule" is NEVER enough by itself to select a tool.
@@ -123,6 +125,9 @@ their real Gmail or Calendar:
   only when both a genuine Gmail read and a genuine Calendar read are clearly requested
   together; a single-tool request must still use gmail_read or calendar_read, not
   cross_tool_read.
+- file_search: the user explicitly wants to find/search their actual local files, filenames,
+  paths, metadata, or indexed document content. Conceptual questions about file search,
+  SQLite FTS5, lexical search, or vector search are ordinary conversation, never this tool.
 
 A conceptual, comparative, or opinion question about Gmail and/or Calendar as products or
 concepts (e.g. "Explain the difference between Gmail and Google Calendar", "Compare email
@@ -185,7 +190,7 @@ confident about. Reads (gmail_read, calendar_read) can tolerate more phrasing sl
 Return ONE valid JSON object with exactly these fields, and nothing else:
 {
   "mode": "answer" | "clarify" | "tool",
-  "tool": null | "gmail_read" | "gmail_compose" | "gmail_reply" | "calendar_read" | "calendar_create" | "cross_tool_read",
+  "tool": null | "gmail_read" | "gmail_compose" | "gmail_reply" | "calendar_read" | "calendar_create" | "cross_tool_read" | "file_search",
   "confidence": 0.0-1.0,
   "arguments": {"recipient_hint": "...", "subject_hint": "...", "body_hint": "...",
                 "title": "...", "start_hint": "...", "end_hint": "...",

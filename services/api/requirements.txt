@@ -18,3 +18,13 @@ tzlocal==5.3.1
 faster-whisper==1.2.0
 sherpa-onnx==1.13.6
 sounddevice==0.5.6
+# Part 11 local file search. Part 11.1 OCR needs no additional package:
+# PyMuPDF drives Tesseract natively via Page.get_textpage_ocr(), and
+# Tesseract itself is a separate local SYSTEM install, not a wheel.
+PyMuPDF==1.28.2
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl==3.1.5
+# Imported by local_files/extractors.py for safe XML parsing. Was missing
+# from this manifest, so a fresh clone could not import the package at all.
+defusedxml==0.7.1

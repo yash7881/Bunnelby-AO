@@ -26,6 +26,7 @@ from .tool_requests import (
     GmailComposeRequest,
     GmailReadRequest,
     GmailReplyRequest,
+    FileSearchRequest,
     ToolRequest,
     ToolRequestValidationError,
     build_request,
@@ -191,6 +192,28 @@ def build_capabilities() -> tuple[Capability, ...]:
             ),
             examples=("Check my latest emails and what's on my calendar tomorrow.",),
         ),
+        Capability(
+            name="file_search",
+            version="1.0",
+            description="Search the approved private local-file index by filename, path, metadata, or document content. Read-only.",
+            request_model=FileSearchRequest,
+            risk_level=RiskLevel.L0_OBSERVE,
+            approval_policy=ApprovalPolicy.NEVER,
+            executor=_late("execute_file_search"),
+            freshness_policy=FreshnessPolicy.CACHED_OK,
+            audit_policy=AuditPolicy.SANITIZED_ARGUMENTS,
+            selection_guidance=(
+                "Only when the user asks to find or search their actual local files or document contents. "
+                "Never for conceptual questions about files, SQLite FTS, lexical search, or vector search. "
+                "root_scope accepts trusted aliases, never paths."
+            ),
+            examples=(
+                "Find my resume PDF.",
+                "Find the document where I wrote about vector databases.",
+                "Which file contains the Bunnelby architecture?",
+                "Search my documents for internship.",
+            ),
+        ),
     )
 
 
@@ -354,6 +377,10 @@ def execute(
     def _audit(result: OrchestratorResult, error_code: str | None = None) -> None:
         approval = result.approval if isinstance(result.approval, Mapping) else None
         approval_id = approval.get("id") if approval else None
+        safe_summary = result.reply
+        if tool == "file_search":
+            count = dict(result.spoken_metadata or {}).get("result_count", 0)
+            safe_summary = f"Local file search returned {count} result(s); snippets omitted from audit."
         run_id = audit_service.record_tool_run(
             tool_name=tool,
             tool_version=capability.version,
@@ -367,7 +394,7 @@ def execute(
             turn_id=turn_id,
             approval_id=int(approval_id) if isinstance(approval_id, int) else None,
             error_code=error_code,
-            user_visible_summary=result.reply,
+            user_visible_summary=safe_summary,
             started_at=started_at,
         )
 
@@ -401,7 +428,13 @@ def execute(
         return blocked
 
     try:
-        result = execute_request(request)
+        if isinstance(request, FileSearchRequest):
+            from .local_files.service import execution_session
+
+            with execution_session(session_id):
+                result = execute_request(request)
+        else:
+            result = execute_request(request)
     except Exception as exc:
         logger.exception("Capability %s raised during execution: %s", tool, exc)
         failure = OrchestratorResult(

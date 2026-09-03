@@ -11,6 +11,7 @@ from .tool_requests import (
     CalendarReadRequest,
     CrossToolReadRequest,
     GmailReadRequest,
+    FileSearchRequest,
     ToolRequest,
 )
 
@@ -198,10 +199,31 @@ def verify_cross_tool_read(request: CrossToolReadRequest, result: Any) -> Verifi
     )
 
 
+def verify_file_search(request: FileSearchRequest, result: Any) -> VerificationResult:
+    """Validate IDs and provenance against the local index and root policy."""
+    from .local_files.service import default_service
+
+    verified, evidence, observed = default_service().verify_envelope(request, result)
+    expected = {
+        "limit": request.limit,
+        "search_mode": request.search_mode,
+        "root_scope": list(request.root_scope),
+        "read_only": True,
+    }
+    return VerificationResult(
+        "FileSearchVerifier",
+        "verified" if verified else "failed",
+        expected,
+        observed,
+        evidence,
+    )
+
+
 READ_VERIFIERS: Final[Mapping[str, Any]] = {
     "gmail_read": verify_gmail_read,
     "calendar_read": verify_calendar_read,
     "cross_tool_read": verify_cross_tool_read,
+    "file_search": verify_file_search,
 }
 
 

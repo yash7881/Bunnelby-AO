@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Final, Literal, Mapping, Sequence
 
@@ -37,6 +38,7 @@ GmailReadKind = Literal["recent", "unread"]
 CalendarReadMode = Literal["agenda", "free_busy", "open_slots"]
 FreshnessPolicy = Literal["cached_ok", "fresh_required"]
 CrossToolSource = Literal["gmail", "calendar"]
+FileSearchMode = Literal["filename", "content", "hybrid"]
 
 
 class ToolRequest(BaseModel):
@@ -240,6 +242,47 @@ class CrossToolReadRequest(ToolRequest):
         return "cross_tool_read"
 
 
+class FileSearchRequest(ToolRequest):
+    """Search only the deterministic allowlisted local index; paths are never accepted."""
+
+    query: str = Field(min_length=1, max_length=500)
+    search_mode: FileSearchMode = "hybrid"
+    limit: int = Field(default=8, ge=1, le=20)
+    root_scope: tuple[str, ...] = ()
+    extensions: tuple[str, ...] = ()
+    modified_after: datetime | None = None
+    modified_before: datetime | None = None
+    within_result_set_id: str | None = Field(default=None, max_length=128)
+    freshness: FreshnessPolicy = "cached_ok"
+
+    @field_validator("root_scope")
+    @classmethod
+    def _root_aliases_only(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        aliases = tuple(dict.fromkeys(item.strip().casefold() for item in value))
+        if any(not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", item) for item in aliases):
+            raise ValueError("root_scope accepts aliases only, never filesystem paths")
+        return aliases
+
+    @field_validator("extensions")
+    @classmethod
+    def _safe_extensions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(dict.fromkeys((item if item.startswith(".") else "." + item).casefold() for item in value))
+        if any(not re.fullmatch(r"\.[a-z0-9]{1,12}", item) for item in normalized):
+            raise ValueError("invalid extension filter")
+        return normalized
+
+    @property
+    def tool_name(self) -> str:
+        return "file_search"
+
+    def audit_arguments(self) -> dict[str, Any]:
+        payload = super().audit_arguments()
+        payload["query_chars"] = len(self.query)
+        payload["query_sha256"] = _fingerprint(self.query)
+        payload.pop("query", None)
+        return payload
+
+
 REQUEST_MODELS: Final[Mapping[str, type[ToolRequest]]] = {
     "general_answer": GeneralAnswerRequest,
     "gmail_read": GmailReadRequest,
@@ -248,6 +291,7 @@ REQUEST_MODELS: Final[Mapping[str, type[ToolRequest]]] = {
     "calendar_read": CalendarReadRequest,
     "calendar_create": CalendarCreateRequest,
     "cross_tool_read": CrossToolReadRequest,
+    "file_search": FileSearchRequest,
 }
 
 # Requests that can produce an external side effect (always via an approval).
@@ -255,7 +299,7 @@ WRITE_REQUEST_NAMES: Final[frozenset[str]] = frozenset(
     {"gmail_compose", "gmail_reply", "calendar_create"}
 )
 READ_REQUEST_NAMES: Final[frozenset[str]] = frozenset(
-    {"gmail_read", "calendar_read", "cross_tool_read"}
+    {"gmail_read", "calendar_read", "cross_tool_read", "file_search"}
 )
 
 
@@ -368,6 +412,7 @@ __all__ = [
     "CalendarReadRequest",
     "CrossToolReadRequest",
     "GeneralAnswerRequest",
+    "FileSearchRequest",
     "GmailComposeRequest",
     "GmailReadRequest",
     "GmailReplyRequest",

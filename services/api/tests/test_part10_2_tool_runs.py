@@ -306,7 +306,21 @@ class VerificationEvidenceWritingTests(unittest.TestCase):
 
 
 class LiveDatabaseStateTests(unittest.TestCase):
-    """Read-only assertions about the real ao.db after migrations 0005/0006."""
+    """Read-only assertions about the real ao.db after migrations 0005/0006.
+
+    These were originally pinned to the exact row counts observed at migration
+    time (722/254/8). That was a test-design defect: messages, approvals,
+    tool_runs and verification_evidence are LIVE user data that grows every time
+    Bunnelby is used, so the assertions failed as soon as the user actually ran
+    it. The migration guarantees they were meant to protect are structural and
+    monotonic, and are expressed that way here.
+
+    The migration-time snapshot itself remains verified exactly, in the
+    pre/post fingerprints recorded under .ao-backups/part10.2-phase*/.
+    """
+
+    # Row counts observed immediately after migrations 0004-0006 completed.
+    MIGRATION_BASELINE = {"messages": 722, "task_log": 254, "approvals": 8}
 
     def test_live_database_has_the_new_tables_and_preserved_history(self) -> None:
         import sqlite3
@@ -317,16 +331,69 @@ class LiveDatabaseStateTests(unittest.TestCase):
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
             tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
-            self.assertIn("tool_runs", tables)
-            self.assertIn("verification_evidence", tables)
-            self.assertIn("task_log", tables)
+            for required in ("tool_runs", "verification_evidence", "task_log", "messages", "approvals"):
+                self.assertIn(required, tables, f"{required} must exist")
             self.assertEqual(
                 con.execute("select version_num from alembic_version").fetchone()[0], "0006"
             )
-            # History preserved exactly.
-            self.assertEqual(con.execute("select count(*) from task_log").fetchone()[0], 254)
-            self.assertEqual(con.execute("select count(*) from approvals").fetchone()[0], 8)
-            self.assertEqual(con.execute("select count(*) from messages").fetchone()[0], 722)
+
+            # task_log is retained as frozen history: nothing writes to it any
+            # more, so its count must be exactly the legacy value.
+            self.assertEqual(
+                con.execute("select count(*) from task_log").fetchone()[0],
+                self.MIGRATION_BASELINE["task_log"],
+                "task_log is dead-router history and must never gain or lose rows",
+            )
+
+            # Live tables may only ever grow. A count BELOW the migration
+            # baseline would mean history was destroyed.
+            for table in ("messages", "approvals"):
+                count = con.execute(f"select count(*) from {table}").fetchone()[0]
+                self.assertGreaterEqual(
+                    count,
+                    self.MIGRATION_BASELINE[table],
+                    f"{table} dropped below its post-migration baseline",
+                )
+        finally:
+            con.close()
+
+    def test_every_message_carries_session_identity(self) -> None:
+        """Phase D backfill plus live writes must leave no unattributed rows."""
+        import sqlite3
+
+        db = REPO_ROOT / "database/ao.db"
+        if not db.exists():
+            self.skipTest("live database not present")
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            orphans = con.execute(
+                "select count(*) from messages where session_id is null or turn_id is null"
+            ).fetchone()[0]
+            self.assertEqual(orphans, 0, "every message row needs session_id and turn_id")
+        finally:
+            con.close()
+
+    def test_live_audit_rows_use_only_declared_vocabularies(self) -> None:
+        """Production audit rows must satisfy the same constraints as tests."""
+        import sqlite3
+
+        db = REPO_ROOT / "database/ao.db"
+        if not db.exists():
+            self.skipTest("live database not present")
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            statuses = {r[0] for r in con.execute("select distinct status from tool_runs")}
+            self.assertLessEqual(
+                statuses,
+                {"success", "failed", "blocked", "requires_approval", "unknown"},
+                f"unexpected tool_runs status in live data: {statuses}",
+            )
+            verdicts = {r[0] for r in con.execute("select distinct verdict from verification_evidence")}
+            self.assertLessEqual(
+                verdicts,
+                {"verified", "failed", "uncertain", "skipped"},
+                f"unexpected verification verdict in live data: {verdicts}",
+            )
         finally:
             con.close()
 

@@ -23,6 +23,7 @@ from .tool_requests import (
     GmailComposeRequest,
     GmailReadRequest,
     GmailReplyRequest,
+    FileSearchRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -593,6 +594,68 @@ def execute_cross_tool_read(request: CrossToolReadRequest) -> OrchestratorResult
     )
 
 
+def execute_file_search(request: FileSearchRequest) -> OrchestratorResult:
+    """Render already-local, deterministic retrieval; no model or cloud call."""
+    from .local_files.service import default_service
+
+    envelope = default_service().search_request(request)
+    if envelope.refinement_missing:
+        reply = "That earlier file result set is not available in this session. Please run the search again."
+        return OrchestratorResult(
+            reply=reply,
+            action_type="file_search",
+            memory_content=f"{reply}\nRoute: file_search",
+            spoken_reply=reply,
+            spoken_metadata={
+                "result_count": 0,
+                "file_ids": [],
+                "chunk_ids": [],
+                "result_set_id": envelope.result_set_id,
+                "refinement_missing": True,
+            },
+        )
+    if not envelope.results:
+        reply = "I didn't find any matching files in the current local index."
+        spoken = reply
+    else:
+        lines = [f"Found {len(envelope.results)} matching file(s):"]
+        for number, item in enumerate(envelope.results, 1):
+            display = f"{item.root_alias.title()}\\{item.relative_path.replace('/', '\\')}"
+            provenance = ", ".join(f"{key.replace('_', ' ')} {value}" for key, value in item.provenance.items())
+            detail = f" — {item.snippet}" if item.snippet else ""
+            lines.append(f"{number}. {display}{' (' + provenance + ')' if provenance else ''}{detail}")
+        reply = "\n".join(lines)
+        spoken = f"I found {len(envelope.results)} matching file{'s' if len(envelope.results) != 1 else ''}."
+    untrusted = "\n\n".join(item.render() for item in envelope.untrusted_snippets)
+    return OrchestratorResult(
+        reply=reply,
+        action_type="file_search",
+        memory_content=f"{reply}\n\n{untrusted}\nRoute: file_search",
+        spoken_reply=spoken,
+        spoken_metadata={
+            "result_count": len(envelope.results),
+            "file_ids": [item.file_id for item in envelope.results],
+            "chunk_ids": [item.chunk_id for item in envelope.results],
+            "root_aliases": sorted({item.root_alias for item in envelope.results}),
+            "result_set_id": envelope.result_set_id,
+            # Part 11.1: per-hit extraction method lets a caller distinguish
+            # OCR-derived text from native text, and lets FileSearchVerifier
+            # confirm the claim against the indexed chunk.
+            "extraction_methods": [
+                item.provenance.get("extraction_method") for item in envelope.results
+            ],
+            "ocr_result_count": sum(
+                1
+                for item in envelope.results
+                if item.provenance.get("extraction_method") == "pymupdf_ocr"
+            ),
+            "needs_ocr_result_count": sum(1 for item in envelope.results if item.needs_ocr),
+            "untrusted_source_ids": [item.source_id for item in envelope.untrusted_snippets],
+            "index_freshness": "snapshot",
+        },
+    )
+
+
 __all__ = [
     "execute_calendar_create",
     "execute_calendar_read",
@@ -601,4 +664,5 @@ __all__ = [
     "execute_gmail_compose",
     "execute_gmail_read",
     "execute_gmail_reply",
+    "execute_file_search",
 ]
