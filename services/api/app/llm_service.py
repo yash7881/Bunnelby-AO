@@ -25,10 +25,11 @@ Provider = Literal["gemini", "groq"]
 
 DEFAULT_GEMINI_MODEL: Final[str] = "gemini-3.6-flash"
 DEFAULT_GEMINI_FAST_MODEL: Final[str] = "gemini-3.5-flash-lite"
-DEFAULT_GROQ_MODEL: Final[str] = "llama-3.3-70b-versatile"
+DEFAULT_GROQ_MODEL: Final[str] = "openai/gpt-oss-120b"
 DEFAULT_GEMINI_COOLDOWN_SECONDS: Final[int] = 900
 DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[int] = 45
 GROQ_CHAT_COMPLETIONS_URL: Final[str] = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODELS_URL: Final[str] = "https://api.groq.com/openai/v1/models"
 GROQ_API_HOST: Final[str] = "api.groq.com"
 RECOVERABLE_GEMINI_CODES: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
 
