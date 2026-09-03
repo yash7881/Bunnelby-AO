@@ -179,6 +179,130 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const bridge = window.bunnelbyVoice;
+    if (!bridge?.onEvent) return undefined;
+
+    return bridge.onEvent((event) => {
+      if (!event || typeof event !== 'object') return;
+
+      const eventType = String(event.event || '');
+
+      if (eventType === 'runtime_ready') {
+        console.info('Bunnelby persistent voice runtime ready', event);
+        return;
+      }
+
+      if (eventType === 'state') {
+        const voiceState = String(event.state || '').toLowerCase();
+
+        if (voiceState === 'listening') {
+          setCoreState('listening');
+          return;
+        }
+
+        if (voiceState === 'follow_up') {
+          setCoreState('listening');
+          setSending(false);
+          return;
+        }
+
+        if (voiceState === 'transcribing' || voiceState === 'thinking') {
+          setCoreState('thinking');
+          setSending(true);
+          return;
+        }
+
+        if (voiceState === 'speaking') {
+          setCoreState('speaking');
+          return;
+        }
+
+        if (voiceState === 'standby') {
+          setCoreState('idle');
+          setSending(false);
+        }
+
+        return;
+      }
+
+      if (eventType === 'wake_detected') {
+        if (voiceFrameRef.current) {
+          window.cancelAnimationFrame(voiceFrameRef.current);
+          voiceFrameRef.current = 0;
+        }
+        voicePlayerRef.current?.stop();
+        setAudioLevel(0);
+        setHistoryOpen(false);
+        setMessage('');
+        setActiveResponse(null);
+        setLayoutMode('home');
+        setCoreState('listening');
+        return;
+      }
+
+      if (eventType === 'user_transcript') {
+        const transcript = String(event.text || '').trim();
+        if (!transcript) return;
+
+        setHistoryOpen(false);
+        setMessage('');
+        setActiveResponse(null);
+        setLayoutMode('processing');
+        setCoreState('thinking');
+        setSending(true);
+        setMessages((current) => [
+          ...current,
+          {
+            role: 'user',
+            content: transcript,
+            source: 'voice',
+            time: new Date().toISOString()
+          }
+        ]);
+        return;
+      }
+
+      if (eventType === 'assistant_response') {
+        const rawReply = String(event.reply || '').trim();
+        const parsed = parseAssistantReply(rawReply);
+        const approval =
+          event.approval && typeof event.approval === 'object'
+            ? event.approval
+            : null;
+        const hasApproval =
+          approval && approval.task_type === 'gmail_reply';
+
+        const assistantMessage = {
+          role: 'assistant',
+          kind: hasApproval ? 'approval' : 'normal',
+          title: hasApproval ? 'Review Gmail reply' : undefined,
+          approval: hasApproval ? approval : undefined,
+          approvalBusy: false,
+          approvalError: '',
+          decisionMessage: '',
+          content: parsed.main || rawReply || 'Bunnelby completed the voice request.',
+          route: parsed.route,
+          why: parsed.why,
+          source: 'voice',
+          time: new Date().toISOString()
+        };
+
+        setMessages((current) => [...current, assistantMessage]);
+        setActiveResponse(assistantMessage);
+        setLayoutMode('response');
+        setSending(false);
+        return;
+      }
+
+      if (eventType === 'runtime_error' || eventType === 'runtime_exit') {
+        console.error('Bunnelby voice runtime:', event.message || eventType);
+        setSending(false);
+        setCoreState('idle');
+      }
+    });
+  }, []);
+
+  useEffect(() => {
     if (!sending && !historyOpen && layoutMode === 'home') {
       inputRef.current?.focus({ preventScroll: true });
     }

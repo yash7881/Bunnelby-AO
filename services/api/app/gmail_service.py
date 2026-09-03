@@ -9,7 +9,7 @@ import re
 import stat
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from email.utils import parseaddr
+from email.utils import getaddresses, parseaddr
 from pathlib import Path
 from typing import Any, Final
 
@@ -858,6 +858,453 @@ def draft_reply_from_request(user_message: str) -> dict[str, str]:
     return draft_reply(thread_id, user_message)
 
 
+_SPOKEN_EMAIL_RE: Final[re.Pattern[str]] = re.compile(
+    r"([a-z0-9](?:[a-z0-9._%+-]*[a-z0-9])?)\s+at\s+the\s+rate\s+"
+    r"([a-z0-9.-]+)\s+dot\s+(com|in|org|net|co|edu|io)\b",
+    re.IGNORECASE,
+)
+_SPOKEN_EMAIL_RE_SIMPLE: Final[re.Pattern[str]] = re.compile(
+    r"([a-z0-9](?:[a-z0-9._%+-]*[a-z0-9])?)\s+at\s+"
+    r"([a-z0-9.-]+)\s+dot\s+(com|in|org|net|co|edu|io)\b",
+    re.IGNORECASE,
+)
+
+# Some STT engines transcribe the spoken word "at" literally while already rendering
+# "dot com" as a literal ".com" suffix (e.g. "trj11114 at gmail.com"). Recognizing that
+# " at " means "@" in this glued-dot shape is only safe when the domain is a well-known
+# personal email provider; an arbitrary "word.tld" domain (e.g. "theredgmail.com") must
+# NOT be silently accepted; see _looks_like_email_attempt() for that fallback.
+_COMMON_EMAIL_DOMAINS: Final[tuple[str, ...]] = (
+    "gmail.com",
+    "googlemail.com",
+    "yahoo.com",
+    "yahoo.co.in",
+    "yahoo.co.uk",
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "msn.com",
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    "aol.com",
+    "protonmail.com",
+    "proton.me",
+    "zoho.com",
+    "rediffmail.com",
+    "gmx.com",
+)
+_COMMON_DOMAIN_ALTERNATION: Final[str] = "|".join(
+    re.escape(domain) for domain in _COMMON_EMAIL_DOMAINS
+)
+_SPOKEN_EMAIL_RE_GLUED_AT_THE_RATE: Final[re.Pattern[str]] = re.compile(
+    r"([a-z0-9](?:[a-z0-9._%+-]*[a-z0-9])?)\s+at\s+the\s+rate\s+"
+    r"(" + _COMMON_DOMAIN_ALTERNATION + r")\b",
+    re.IGNORECASE,
+)
+_SPOKEN_EMAIL_RE_GLUED_SIMPLE: Final[re.Pattern[str]] = re.compile(
+    r"([a-z0-9](?:[a-z0-9._%+-]*[a-z0-9])?)\s+at\s+"
+    r"(" + _COMMON_DOMAIN_ALTERNATION + r")\b",
+    re.IGNORECASE,
+)
+
+# An "email attempt" hint that still contains "@" or a spoken " at <domain-like text>"
+# marker after normalization failed to produce a valid address. This must route straight
+# to clarification, never to Gmail correspondent/name lookup: the text is a garbled or
+# unrecognized address, not a person's name.
+_EMAIL_ATTEMPT_HINT_RE: Final[re.Pattern[str]] = re.compile(
+    r"@|\bat\b\s+(?:the\s+rate\s+)?[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}",
+    re.IGNORECASE,
+)
+
+
+def normalize_spoken_email(user_message: str) -> str:
+    """Rewrite deterministic spoken-out email phrasing into a real address.
+
+    Conservative and regex-based only: e.g. "trj11114 at the rate gmail dot com" ->
+    "trj11114@gmail.com", or "trj11114 at gmail.com" -> "trj11114@gmail.com". Never
+    LLM-guessed; only exact recognized spoken patterns are rewritten, and only the
+    formatting markers (" at ", " at the rate ", " dot ", casing, whitespace) are
+    changed -- individual alphanumeric characters in the local-part or domain are never
+    altered, guessed, or fuzzy-corrected. Everything else in the message is left
+    untouched.
+    """
+    def _replace_dot_word(match: re.Match[str]) -> str:
+        local_part = match.group(1).replace(" ", "").casefold()
+        domain = match.group(2).replace(" ", "").casefold()
+        tld = match.group(3).casefold()
+        return f"{local_part}@{domain}.{tld}"
+
+    def _replace_glued(match: re.Match[str]) -> str:
+        local_part = match.group(1).replace(" ", "").casefold()
+        domain = match.group(2).casefold()
+        return f"{local_part}@{domain}"
+
+    text = _SPOKEN_EMAIL_RE.sub(_replace_dot_word, user_message)
+    text = _SPOKEN_EMAIL_RE_SIMPLE.sub(_replace_dot_word, text)
+    text = _SPOKEN_EMAIL_RE_GLUED_AT_THE_RATE.sub(_replace_glued, text)
+    text = _SPOKEN_EMAIL_RE_GLUED_SIMPLE.sub(_replace_glued, text)
+    return text
+
+
+def _looks_like_email_attempt(hint: str) -> bool:
+    """True when a recipient hint looks like a garbled/unresolved email address.
+
+    Used to prevent Gmail correspondent/name lookup from ever running on text the
+    user clearly intended as an address (contains "@" or a spoken " at <domain>"
+    marker) but that did not deterministically normalize to a valid address -- such
+    text must fail closed to clarification, not a fuzzy name search.
+    """
+    return bool(_EMAIL_ATTEMPT_HINT_RE.search(hint))
+
+
+def _new_email_recipient_hint(user_message: str) -> str:
+    """Extract only the intended human recipient hint, not the email body."""
+    text = user_message.strip()
+
+    patterns = (
+        # "send an email to Rahul ..."
+        r"\b(?:send|write|compose|draft)\s+(?:an?\s+)?(?:email|mail)\s+to\s+(.+?)(?=\s+(?:and|saying|say|telling|tell|that|ki|likh|about)\b|$)",
+
+        # "Rahul ko email send karo ..."
+        r"^\s*(.+?)\s+(?:ko\s+)?(?:email|mail)\s+(?:send|bhej(?:o|na)?|karo|kro)\b",
+
+        # "email Rahul and tell..."
+        r"\b(?:email|mail)\s+(.+?)(?=\s+(?:and|saying|say|tell|telling|ki|likh)\b|$)",
+
+        # "email send karo Rahul ko..."
+        r"\b(?:email|mail)\s+(?:send|bhej(?:o|na)?|karo|kro)\s+(?:to\s+|ko\s+)?(.+?)(?=\s+(?:and|saying|say|tell|ki|likh)\b|$)",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+
+        hint = match.group(1).strip(" ,.:;!?\\\"'")
+        hint = re.sub(r"\b(?:please|pls)\b", " ", hint, flags=re.IGNORECASE)
+        hint = re.sub(r"\s+", " ", hint).strip()
+
+        if hint and len(hint) <= 120:
+            return hint
+
+    return ""
+
+
+def _participant_candidates_from_message(
+    service: Any,
+    message_id: str,
+) -> list[tuple[str, str]]:
+    message = _execute(
+        service.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=["From", "To", "Cc"],
+        )
+    )
+
+    headers = _headers(message.get("payload", {}) or {})
+    values = [
+        headers.get("from", ""),
+        headers.get("to", ""),
+        headers.get("cc", ""),
+    ]
+
+    result: list[tuple[str, str]] = []
+    for display_name, address in getaddresses(values):
+        address = address.strip().casefold()
+        display_name = display_name.strip()
+        if address and EMAIL_ADDRESS_PATTERN.fullmatch(address):
+            result.append((display_name, address))
+    return result
+
+
+def _partial_email_clue(user_message: str) -> str:
+    """Extract a partial address clue such as `trj...` safely."""
+    text = user_message.strip().casefold().replace("?", "...")
+
+    match = re.search(
+        r"(?<![a-z0-9._%+-])"
+        r"([a-z0-9][a-z0-9._%+-]{1,})"
+        r"\.{3}"
+        r"(?:@gmail\.com)?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).rstrip(".")
+
+    match = re.search(
+        r"\b(?:email|address)(?:\s+id)?\s+"
+        r"(?:starts?|start|shuru|begin)\s+(?:with|se)\s+"
+        r"([a-z0-9][a-z0-9._%+-]{1,})\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return match.group(1)
+
+    return ""
+
+def _search_gmail_addresses_by_partial(partial: str) -> list[str]:
+    """Search Gmail history and return participant addresses containing partial."""
+    partial = partial.strip().casefold()
+    if len(partial) < 2:
+        return []
+
+    partial = _partial_email_clue(user_message)
+    if partial:
+        partial_matches = _search_gmail_addresses_by_partial(partial)
+
+        if len(partial_matches) == 1:
+            logger.info(
+                "Resolved Gmail recipient from partial clue=%r address=%s",
+                partial,
+                partial_matches[0],
+            )
+            return partial_matches[0]
+
+        if len(partial_matches) > 1:
+            shown = ", ".join(partial_matches[:5])
+            raise GmailDraftError(
+                f"I found multiple Gmail addresses matching {partial!r}: {shown}. "
+                "Tell me which one to use."
+            )
+
+        raise GmailDraftError(
+            f"I couldn't find a Gmail correspondent whose address contains {partial!r}. "
+            "Give me another part of the address or the exact email."
+        )
+
+    service = _gmail_service()
+    profile = _execute(service.users().getProfile(userId="me"))
+    own_email = str(profile.get("emailAddress", "")).strip().casefold()
+
+    message_ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    # Search both correspondence directions plus Gmail's general index.
+    for query in (
+        f"from:{partial}",
+        f"to:{partial}",
+        partial,
+    ):
+        result = _execute(
+            service.users()
+            .messages()
+            .list(
+                userId="me",
+                q=query,
+                maxResults=100,
+            )
+        )
+
+        for ref in result.get("messages", []) or []:
+            message_id = str(ref.get("id", "")).strip()
+            if message_id and message_id not in seen_ids:
+                seen_ids.add(message_id)
+                message_ids.append(message_id)
+
+    addresses: list[str] = []
+    seen_addresses: set[str] = set()
+
+    for message_id in message_ids:
+        for _display_name, address in _participant_candidates_from_message(
+            service,
+            message_id,
+        ):
+            normalized = address.strip().casefold()
+
+            if (
+                normalized
+                and normalized != own_email
+                and partial in normalized
+                and normalized not in seen_addresses
+            ):
+                seen_addresses.add(normalized)
+                addresses.append(normalized)
+
+    return addresses
+
+
+def resolve_new_email_recipient(user_message: str) -> str:
+    """Resolve one recipient conservatively from explicit address or Gmail history.
+
+    Precedence (deterministic, in order):
+    1. Already a valid explicit email address, or text that deterministically
+       normalizes to one via normalize_spoken_email() -- used directly, Gmail
+       correspondent/name lookup is never attempted.
+    2. A partial address clue (e.g. "trj...") resolved against Gmail history.
+    3. A recipient hint that still looks like a garbled/unresolved email attempt
+       (contains "@" or a spoken " at <domain>" marker) -- fails closed to
+       clarification, never to correspondent lookup, never to a guessed domain.
+    4. Only once the hint does not look like an email attempt at all (i.e. it is
+       actually a bare name/hint such as "Rahul") is Gmail correspondent lookup used.
+    """
+    # Step 1: recognize an already-valid or deterministically-normalizable explicit
+    # address before anything else even looks at Gmail correspondent history.
+    user_message = normalize_spoken_email(user_message)
+
+    explicit = [
+        match.group(0).strip().casefold()
+        for match in EMAIL_ADDRESS_PATTERN.finditer(user_message)
+        if "..." not in match.group(0) and "\u2026" not in match.group(0)
+    ]
+
+    explicit = list(dict.fromkeys(explicit))
+    if len(explicit) == 1:
+        return explicit[0]
+    if len(explicit) > 1:
+        raise GmailDraftError(
+            "I found more than one email address. Specify one recipient."
+        )
+
+    partial = _partial_email_clue(user_message)
+    if partial:
+        partial_matches = _search_gmail_addresses_by_partial(partial)
+
+        if len(partial_matches) == 1:
+            return partial_matches[0]
+
+        if len(partial_matches) > 1:
+            shown = ", ".join(partial_matches[:5])
+            raise GmailDraftError(
+                f"I found multiple Gmail addresses matching {partial!r}: {shown}. "
+                "Tell me which one to use."
+            )
+
+        raise GmailDraftError(
+            f"I couldn't find a Gmail correspondent whose address contains {partial!r}. "
+            "Give me another part of the address or the exact email."
+        )
+
+    hint = _new_email_recipient_hint(user_message)
+    if not hint:
+        raise GmailDraftError(
+            "I understood that you want to send a new email, but I couldn't identify "
+            "the recipient. Tell me the person's name or exact email address."
+        )
+
+    # Step 3: the hint still reads as an email attempt (contains "@" or a spoken
+    # " at <domain>" marker) but did not deterministically normalize to a valid
+    # address above -- e.g. a malformed/unrecognized domain. Never guess a domain
+    # and never run a Gmail correspondent/name search on garbled address text; fail
+    # closed to clarification instead.
+    if _looks_like_email_attempt(hint):
+        raise GmailDraftError(
+            f"{hint!r} doesn't look like a valid, exact email address. "
+            "Give me the exact email address."
+        )
+
+    # Step 4: only a genuine bare name/hint reaches Gmail correspondent lookup.
+    service = _gmail_service()
+    profile = _execute(service.users().getProfile(userId="me"))
+    own_email = str(profile.get("emailAddress", "")).strip().casefold()
+
+    safe_hint = re.sub(r'["\\\\\r\n{}]+', " ", hint).strip()
+    if not safe_hint:
+        raise GmailDraftError("The Gmail recipient name was not usable.")
+
+    # Gmail braces mean OR: find correspondence where this person appears
+    # as sender OR recipient.
+    gmail_query = f'{{from:"{safe_hint}" to:"{safe_hint}"}}'
+
+    search = _execute(
+        service.users()
+        .messages()
+        .list(
+            userId="me",
+            q=gmail_query,
+            maxResults=50,
+        )
+    )
+
+    refs = search.get("messages", []) or []
+    if not refs:
+        raise GmailDraftError(
+            f"I couldn't find a Gmail correspondent matching {hint!r}. "
+            "Give me the exact email address."
+        )
+
+    hint_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9._+-]{2,}", hint.casefold())
+    }
+
+    scores: dict[str, float] = {}
+    labels: dict[str, str] = {}
+
+    for index, ref in enumerate(refs):
+        message_id = str(ref.get("id", "")).strip()
+        if not message_id:
+            continue
+
+        for display_name, address in _participant_candidates_from_message(
+            service,
+            message_id,
+        ):
+            if not address or address == own_email:
+                continue
+
+            searchable = f"{display_name} {address}".casefold()
+            candidate_tokens = {
+                token
+                for token in re.findall(r"[a-z0-9._+-]{2,}", searchable)
+            }
+
+            overlap = len(hint_tokens & candidate_tokens)
+            exact_name = (
+                bool(display_name)
+                and hint.casefold() == display_name.casefold()
+            )
+            contains_name = hint.casefold() in searchable
+
+            score = (
+                overlap * 4.0
+                + (10.0 if exact_name else 0.0)
+                + (5.0 if contains_name else 0.0)
+                + max(0.0, 1.0 - index * 0.02)
+            )
+
+            scores[address] = max(scores.get(address, 0.0), score)
+            labels[address] = display_name or address
+
+    ranked = sorted(
+        scores.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    if not ranked or ranked[0][1] < 4.0:
+        raise GmailDraftError(
+            f"I found Gmail history, but couldn't safely identify which address belongs "
+            f"to {hint}. Give me the exact address."
+        )
+
+    best_address, best_score = ranked[0]
+
+    # If another candidate is close, do not guess.
+    if len(ranked) > 1 and ranked[1][1] >= best_score - 2.0:
+        first_address = ranked[0][0]
+        second_address = ranked[1][0]
+        raise GmailDraftError(
+            f"I found multiple possible recipients for {hint}: "
+            f"{labels[first_address]} <{first_address}> and "
+            f"{labels[second_address]} <{second_address}>. "
+            "Tell me which one to use."
+        )
+
+    logger.info(
+        "Resolved Gmail compose recipient hint=%r address=%s",
+        hint,
+        best_address,
+    )
+    return best_address
+
+
 def _extract_single_recipient(user_message: str) -> str:
     addresses: list[str] = []
     seen: set[str] = set()
@@ -902,14 +1349,14 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
 
 def draft_new_email_from_request(user_message: str) -> dict[str, str]:
-    """Draft one standalone email to an explicit address. This function never sends."""
+    """Draft one standalone email to an explicit or safely resolved recipient. Never sends."""
     instruction = user_message.strip()
     if not instruction:
         raise GmailDraftError("A new-email drafting instruction is required.")
     if len(instruction) > 6000:
         raise GmailDraftError("The new-email instruction is too long.")
 
-    recipient = _extract_single_recipient(instruction)
+    recipient = resolve_new_email_recipient(instruction)
     try:
         result = generate_gemini_text(
             system_instruction=COMPOSE_SYSTEM_INSTRUCTION,

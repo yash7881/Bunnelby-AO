@@ -16,7 +16,7 @@ from faster_whisper import WhisperModel
 SAMPLE_RATE = 16_000
 READ_SECONDS = 0.10
 WAKE_ASR_MODEL = "base.en"
-WAKE_HOTWORDS = "Hey Bunnelby Bonilby Bonnellby"
+WAKE_HOTWORDS = "Hey Bunnelby Hello Bunnelby Bonilby Bonnellby"
 
 
 def _sounddevice():
@@ -27,14 +27,17 @@ def _sounddevice():
         raise RuntimeError("sounddevice/PortAudio is unavailable for live microphone use.") from exc
     return sounddevice
 
-# Safe acoustic variants observed in the user's real recordings.
-# Deliberately excludes bare "Bunnelby" and common phrases such as
-# "hey but there'll be" because recall must not be bought with unsafe FP risk.
+# Strict safe forms for the two explicitly supported wake phrases.
+# Bare "Bunnelby" and confusable ordinary phrases remain rejected.
 SAFE_WAKE_FORMS = {
     "hey bunnelby",
     "hey bonilby",
     "hey bonnellby",
     "hey bundle b",
+    "hello bunnelby",
+    "hello bonilby",
+    "hello bonnellby",
+    "hello bundle b",
 }
 
 # Use an immutable upstream Silero revision as the primary bootstrap source.
@@ -251,9 +254,13 @@ def default_microphone(device_index: int | None):
 
 
 def emit_wake_event(*, transcript: str, latency: float, candidate_seconds: float) -> None:
+    normalized = normalize_text(transcript)
+    canonical_phrase = (
+        "Hello Bunnelby" if normalized.startswith("hello ") else "Hey Bunnelby"
+    )
     payload = {
         "event": "wake_detected",
-        "wake_phrase": "Hey Bunnelby",
+        "wake_phrase": canonical_phrase,
         "transcript": transcript,
         "latency_seconds": round(latency, 4),
         "candidate_seconds": round(candidate_seconds, 4),
@@ -268,13 +275,18 @@ def run_self_test() -> int:
         "HEY BONILBY!",
         "Hey, Bonnellby.",
         "hey bundle b",
+        "Hello Bunnelby",
+        "HELLO BONILBY!",
+        "Hello, Bonnellby.",
+        "hello bundle b",
     ]
     expected_false = [
         "Bunnelby",
         "hey but there'll be",
         "hey buddy",
         "bundle b",
-        "hello bunnelby",
+        "hello buddy",
+        "hello but there'll be",
         "",
     ]
 
@@ -311,7 +323,7 @@ def run_listener(args: argparse.Namespace) -> int:
     print(f"Microphone: [{device_index}] {device['name']}")
     print(f"VAD: Silero ONNX | threshold={VAD_THRESHOLD}")
     print(f"ASR: {WAKE_ASR_MODEL} CPU/int8")
-    print("Matcher: strict safe forms only")
+    print("Matcher: strict 'Hey Bunnelby' + 'Hello Bunnelby' safe forms")
     print(f"Cooldown: {args.cooldown:.1f}s")
     print("Audio saved: NO")
     print("Pre-wake audio leaves device: NO")

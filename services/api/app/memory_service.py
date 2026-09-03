@@ -21,6 +21,12 @@ DEFAULT_RECENT_TURNS: Final[int] = 10
 DEFAULT_RELEVANT_OLD_TURNS: Final[int] = 4
 DEFAULT_SCAN_MESSAGES: Final[int] = 500
 MAX_MESSAGE_CHARS: Final[int] = 1600
+# The immediately preceding turn (MOST RECENT TURN) gets a wider, but still bounded, budget.
+# A full Gmail/Calendar triage result (several items with sender/subject/time each) can
+# legitimately exceed MAX_MESSAGE_CHARS; without this the tail items (e.g. later emails in a
+# list) were silently clipped out of the one turn the brain most needs to reason over for a
+# "which one" style follow-up.
+MOST_RECENT_TURN_MAX_CHARS: Final[int] = 3200
 
 _STOPWORDS: Final[frozenset[str]] = frozenset(
     {
@@ -53,6 +59,10 @@ _ROUTE_METADATA_LINE: Final[re.Pattern[str]] = re.compile(
     r"(?im)^\s*(?:Route|Why):\s*[^\n]*\n?"
 )
 
+_ROUTE_VALUE_LINE: Final[re.Pattern[str]] = re.compile(
+    r"(?im)^\s*Route:\s*([^\n]+)"
+)
+
 
 @dataclass(frozen=True)
 class UserProfile:
@@ -68,6 +78,7 @@ class MemoryTurn:
     assistant_id: int
     user: str
     assistant: str
+    route: str | None = None
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 1000) -> int:
@@ -139,11 +150,11 @@ def _assistant_is_memory_safe(content: str) -> bool:
     )
 
 
-def _clip(text: str) -> str:
+def _clip(text: str, limit: int = MAX_MESSAGE_CHARS) -> str:
     text = text.strip()
-    if len(text) <= MAX_MESSAGE_CHARS:
+    if len(text) <= limit:
         return text
-    return text[: MAX_MESSAGE_CHARS - 1].rstrip() + "…"
+    return text[: limit - 1].rstrip() + "…"
 
 
 def _rows_to_safe_turns(rows: list[Message]) -> list[MemoryTurn]:
@@ -162,16 +173,33 @@ def _rows_to_safe_turns(rows: list[Message]) -> list[MemoryTurn]:
             continue
 
         if role == "assistant" and pending_user is not None:
+            route_match = _ROUTE_VALUE_LINE.search(content)
+            route = (
+                route_match.group(1).strip().casefold()
+                if route_match
+                else None
+            )
+
+            if "Cross-tool plan:" in content:
+                route = "cross_tool"
+
             safe_content = _sanitize_assistant_memory(content)
+
             if _assistant_is_memory_safe(safe_content):
+                # Store at the widest ceiling any section could need (MOST_RECENT_TURN_MAX_CHARS).
+                # _format_turns() re-clips down to the tighter MAX_MESSAGE_CHARS budget for
+                # every section except the most recent turn, so older/background context stays
+                # exactly as bounded as before.
                 turns.append(
                     MemoryTurn(
                         user_id=int(pending_user.id),
                         assistant_id=int(row.id),
-                        user=_clip(str(pending_user.content)),
-                        assistant=_clip(safe_content),
+                        user=_clip(str(pending_user.content), MOST_RECENT_TURN_MAX_CHARS),
+                        assistant=_clip(safe_content, MOST_RECENT_TURN_MAX_CHARS),
+                        route=route,
                     )
                 )
+
             pending_user = None
 
     return turns
@@ -211,11 +239,49 @@ def _turn_relevance(query_terms: set[str], turn: MemoryTurn) -> float:
     return (user_overlap * 2.0) + assistant_overlap
 
 
-def _format_turns(turns: list[MemoryTurn]) -> str:
+def _format_turns(turns: list[MemoryTurn], *, limit: int = MAX_MESSAGE_CHARS) -> str:
     blocks: list[str] = []
     for turn in turns:
-        blocks.append(f"User: {turn.user}\nBunnelby: {turn.assistant}")
+        blocks.append(
+            f"User: {_clip(turn.user, limit)}\nBunnelby: {_clip(turn.assistant, limit)}"
+        )
     return "\n\n".join(blocks)
+
+
+_TEMPORAL_RECALL_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:last|latest|recent|previous|earlier|before|pehle|pichl[aei]|"
+    r"last\s+kya|abhi\s+tak|hamne\s+last)\b",
+    re.IGNORECASE,
+)
+
+_FOLLOW_UP_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^\s*(?:and\b|also\b|then\b|what\s+about\b|how\s+about\b|"
+    r"it\b|that\b|this\b|aur\b|phir\b|toh?\b|iska\b|uska\b)",
+    re.IGNORECASE,
+)
+
+# A "which one"-style follow-up references a SET/COLLECTION the previous turn already
+# returned (several emails, several meetings, several enumerated options, ...). This is
+# domain-agnostic on purpose -- it is not Gmail- or Calendar-specific -- and, unlike
+# _FOLLOW_UP_REFERENCE_PATTERN above, it is not anchored to the start of the message because
+# these phrasings commonly appear mid-sentence ("out of those, which one...").
+_COLLECTION_FOLLOW_UP_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:which\s+(?:one|ones|is|are)|the\s+first\s+one|the\s+last\s+one|"
+    r"the\s+second\s+one|any\s+of\s+(?:them|these|those)|"
+    r"all\s+of\s+(?:them|these|those)|none\s+of\s+(?:them|these|those)|"
+    r"either\s+of\s+(?:them|these|those))\b",
+    re.IGNORECASE,
+)
+
+_TOOL_MEMORY_CUE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:gmail|e-?mail|mail|inbox|calendar|agenda|meeting|"
+    r"schedule|event|availability)\b",
+    re.IGNORECASE,
+)
+
+_TOOL_MEMORY_ROUTES: Final[frozenset[str]] = frozenset(
+    {"gmail", "calendar", "cross_tool"}
+)
 
 
 def build_memory_context(current_user_message: str) -> str:
@@ -223,25 +289,87 @@ def build_memory_context(current_user_message: str) -> str:
     profile = load_user_profile()
     all_turns = _load_safe_turns()
 
-    recent_count = _env_int(
-        "AO_RECENT_MEMORY_TURNS", DEFAULT_RECENT_TURNS, minimum=1, maximum=20
+    configured_recent_count = _env_int(
+        "AO_RECENT_MEMORY_TURNS",
+        DEFAULT_RECENT_TURNS,
+        minimum=1,
+        maximum=20,
     )
     relevant_count = _env_int(
-        "AO_RELEVANT_OLD_MEMORY_TURNS", DEFAULT_RELEVANT_OLD_TURNS, minimum=1, maximum=10
+        "AO_RELEVANT_OLD_MEMORY_TURNS",
+        DEFAULT_RELEVANT_OLD_TURNS,
+        minimum=1,
+        maximum=10,
     )
 
-    recent_turns = all_turns[-recent_count:]
+    temporal_recall = bool(
+        _TEMPORAL_RECALL_PATTERN.search(current_user_message)
+    )
+    follow_up_reference = bool(
+        _FOLLOW_UP_REFERENCE_PATTERN.search(current_user_message)
+    ) or bool(
+        _COLLECTION_FOLLOW_UP_PATTERN.search(current_user_message)
+    )
+    explicit_tool_context = bool(
+        _TOOL_MEMORY_CUE_PATTERN.search(current_user_message)
+    )
+
+    # Tool history is useful when explicitly requested, during temporal recall,
+    # or for a direct follow-up. It is harmful noise for unrelated casual chat.
+    allow_tool_memory = (
+        explicit_tool_context
+        or temporal_recall
+        or follow_up_reference
+    )
+
+    if allow_tool_memory:
+        eligible_turns = all_turns
+    else:
+        eligible_turns = [
+            turn
+            for turn in all_turns
+            if turn.route not in _TOOL_MEMORY_ROUTES
+        ]
+
+    # Standalone conversational turns need a small working-memory window.
+    # Direct follow-ups are allowed a wider window to preserve continuity.
+    recent_count = (
+        configured_recent_count
+        if follow_up_reference or temporal_recall
+        else min(configured_recent_count, 4)
+    )
+
+    recent_turns = eligible_turns[-recent_count:]
     recent_ids = {turn.user_id for turn in recent_turns}
-    old_turns = [turn for turn in all_turns[:-recent_count] if turn.user_id not in recent_ids]
+
+    old_pool = (
+        eligible_turns[:-recent_count]
+        if len(eligible_turns) > recent_count
+        else []
+    )
+    old_turns = [
+        turn
+        for turn in old_pool
+        if turn.user_id not in recent_ids
+    ]
 
     query_terms = _terms(current_user_message)
     ranked_old = sorted(
-        ((turn, _turn_relevance(query_terms, turn)) for turn in old_turns),
+        (
+            (turn, _turn_relevance(query_terms, turn))
+            for turn in old_turns
+        ),
         key=lambda item: (item[1], item[0].assistant_id),
         reverse=True,
     )
-    relevant_old = [turn for turn, score in ranked_old if score > 0][:relevant_count]
-    relevant_old.reverse()  # Present selected memories in conversational order.
+
+    relevant_old = [
+        turn
+        for turn, score in ranked_old
+        if score > 0
+    ][:relevant_count]
+
+    relevant_old.reverse()
 
     sections = [
         "LOCAL BUNNELBY USER PROFILE (trusted local profile):",
@@ -252,10 +380,23 @@ def build_memory_context(current_user_message: str) -> str:
     ]
 
     if recent_turns:
+        earlier_recent_turns = recent_turns[:-1]
+        most_recent_turn = recent_turns[-1]
+
+        if earlier_recent_turns:
+            sections.extend(
+                [
+                    "\nEARLIER RECENT CONVERSATION (older than the immediately preceding turn, "
+                    "oldest to newest -- lower priority background context):",
+                    _format_turns(earlier_recent_turns),
+                ]
+            )
+
         sections.extend(
             [
-                "\nRECENT CONVERSATION AND TOOL RESULTS (oldest to newest):",
-                _format_turns(recent_turns),
+                "\nMOST RECENT TURN (the immediately preceding exchange -- this is the current "
+                "active topic):",
+                _format_turns([most_recent_turn], limit=MOST_RECENT_TURN_MAX_CHARS),
             ]
         )
 
@@ -274,7 +415,29 @@ def build_memory_context(current_user_message: str) -> str:
         "results in recent conversation are valid conversational memory. For temporal recap "
         "questions such as 'what did we last do', 'last kya kaam kiya', or 'most recent work', "
         "answer from the newest recent turns first and do not substitute older topic matches. "
-        "Do not mention these memory mechanics unless the user asks about memory."
+        "Never answer an unrelated conversational message with Gmail, Calendar, or other "
+        "tool history. Tool history is context only when the current message actually refers "
+        "to it. Do not mention these memory mechanics unless the user asks about memory.\n\n"
+        "Reference resolution priority: when the current user message contains an ambiguous "
+        "reference such as 'it', 'that', 'this', 'they', or an implicit follow-up (e.g. "
+        "'explain it more', 'give a real life example', 'compare that with X') and the current "
+        "message is not self-contained, resolve the reference in this order: (1) the current "
+        "user message itself, if it already names the topic; (2) the MOST RECENT TURN above -- "
+        "treat this as the current active topic and the primary candidate; (3) EARLIER RECENT "
+        "CONVERSATION only if the most recent turn offers no plausible referent; (4) RELEVANT "
+        "OLDER LOCAL MEMORY only as a last resort, and never to override an obvious antecedent "
+        "already present in the most recent turn. Only ask for clarification when the most "
+        "recent turn itself introduced multiple distinct, unrelated topics and the current "
+        "message gives no way to safely pick one -- do not ask for clarification when the most "
+        "recent turn has one clear topic just because that topic's explanation also mentions "
+        "related concepts in passing.\n\n"
+        "Set/collection references: when the MOST RECENT TURN presented ONE coherent result "
+        "set (several emails from one Gmail read, several meetings from one Calendar read, "
+        "several files from one search, or several options Bunnelby itself enumerated in one "
+        "answer), that whole set is a SINGLE resolvable referent, not multiple competing "
+        "topics. A follow-up like 'which one', 'which is most important', 'the first one', or "
+        "'any of them' should be resolved by reasoning over the items already listed in that "
+        "turn, not treated as ambiguous and not answered by re-fetching the same data."
     )
     return "\n".join(sections)
 

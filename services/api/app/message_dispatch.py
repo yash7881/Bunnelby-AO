@@ -36,7 +36,7 @@ from .gmail_service import (
     GmailServiceError,
     draft_new_email_from_request,
 )
-from .orchestrator import OrchestratorResult, handle_message_result as _base_handle_message_result
+from .orchestrator import OrchestratorResult
 from .spoken_briefing import (
     calendar_agenda_briefing,
     calendar_free_busy_briefing,
@@ -93,12 +93,31 @@ def _normalize_calendar_time_language(user_message: str) -> str:
 
 
 def _standalone_email_requested(user_message: str) -> bool:
-    return bool(
-        _EMAIL_RE.search(user_message)
-        and _COMPOSE_ACTION_RE.search(user_message)
-        and not _REPLY_RE.search(user_message)
-        and not _CALENDAR_CUE_RE.search(user_message)
+    """Detect an explicit NEW-email action.
+
+    An exact address is ideal but no longer mandatory here: Bunnelby may
+    conservatively resolve a named recipient from the user's Gmail history.
+    Reply commands remain on the existing reply-thread path.
+    """
+    text = user_message.strip()
+    if not text:
+        return False
+
+    if _REPLY_RE.search(text) or _CALENDAR_CUE_RE.search(text):
+        return False
+
+    has_email_word = bool(
+        re.search(r"\b(?:email|e-mail|mail|gmail)\b", text, re.IGNORECASE)
     )
+    has_compose_action = bool(
+        re.search(
+            r"\b(?:send|compose|write|draft|bhej(?:o|na)?|bhejo|karo|kro|likho)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+    return bool(has_email_word and has_compose_action)
 
 
 def _calendar_requested(user_message: str) -> bool:
@@ -321,7 +340,31 @@ def _gmail_compose_result(user_message: str) -> OrchestratorResult:
             approval=public,
         )
     except GmailDraftError as exc:
-        return _result(f"I couldn't create the new Gmail draft: {exc}", spoken_reply="I couldn't prepare that new email. Nothing was sent.", action_type="error", route="gmail", reason="gmail draft error")
+        detail = str(exc)
+        clarification = bool(
+            re.search(
+                r"(multiple|which one|identify|recipient|exact email|exact address|correspondent|matching)",
+                detail,
+                re.IGNORECASE,
+            )
+        )
+        return _result(
+            detail if clarification else f"I couldn't create the new Gmail draft: {detail}",
+            spoken_reply=(
+                "???? ??? ??????? ????? ?? ??? ????? ?? ??????? ??????"
+                if language == "hi" and clarification
+                else "I need one more detail to identify the correct recipient."
+                if clarification
+                else "I couldn't prepare that new email. Nothing was sent."
+            ),
+            action_type="clarification_required" if clarification else "error",
+            route="gmail",
+            reason=(
+                "gmail recipient clarification required"
+                if clarification
+                else "gmail draft error"
+            ),
+        )
     except GmailConfigurationError as exc:
         return _result(f"Bunnelby Gmail setup is incomplete: {exc}", spoken_reply="Gmail setup is incomplete. Nothing was sent.", action_type="error", route="gmail", reason="gmail configuration error")
     except GmailAuthorizationError as exc:
@@ -334,11 +377,27 @@ def _gmail_compose_result(user_message: str) -> OrchestratorResult:
 
 
 def handle_message_result(user_message: str) -> OrchestratorResult:
-    """Active dispatch layer for production tool handlers before generic intent fallback."""
-    if _standalone_email_requested(user_message):
-        return _gmail_compose_result(user_message)
-    if is_agenda_request(user_message):
-        return _calendar_agenda_result(user_message)
-    if _calendar_requested(user_message):
-        return _calendar_result(user_message)
-    return _base_handle_message_result(user_message)
+    """Brain-first dispatch: a single semantic LLM decision routes every turn.
+
+    A deterministic regex gate no longer runs before the LLM sees the message. Instead
+    brain_agent.decide() classifies the turn (answer / clarify / tool), and only a
+    mode=="tool" decision reaches deterministic execution via tool_executor, which in turn
+    reuses the existing builder functions below (_gmail_compose_result, _calendar_result,
+    _calendar_agenda_result) purely as execution helpers.
+    """
+    from . import tool_executor  # local import avoids a circular import at module load time
+    from .brain_agent import decide as brain_decide
+
+    decision = brain_decide(user_message)
+
+    if decision.mode == "tool":
+        return tool_executor.execute(decision, user_message)
+
+    action_type = "general_answer" if decision.mode == "answer" else "clarification_required"
+    reply = decision.reply
+    return OrchestratorResult(
+        reply=reply,
+        action_type=action_type,
+        memory_content=f"{reply}\nRoute: brain\nWhy: {decision.reason or decision.mode}",
+        spoken_reply=decision.spoken_reply or None,
+    )

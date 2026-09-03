@@ -31,9 +31,14 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
     def test_strict_wake_normalization_and_confusable_rejection(self) -> None:
         self.assertTrue(always_on_wake_listener.wake_match("HEY, BUNNELBY!"))
         self.assertTrue(always_on_wake_listener.wake_match("Hey Bonilby"))
+        self.assertTrue(always_on_wake_listener.wake_match("Hello Bunnelby"))
+        self.assertTrue(always_on_wake_listener.wake_match("HELLO BONILBY!"))
+
         for phrase in (
             "Bunnelby",
-            "hello Bunnelby",
+            "hello",
+            "hello buddy",
+            "hello everyone",
             "hey buddy",
             "hey but there'll be",
             "bundle b",
@@ -64,14 +69,14 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
                 "0",
                 "--max-utterance",
                 "999",
-                "--barge-in-echo-threshold",
-                "2",
+                "--barge-in-echo-margin",
+                "99",
             ]
         )
         self.assertEqual(clamped.follow_up_seconds, 60.0)
         self.assertEqual(clamped.conversation_silence, 0.5)
         self.assertEqual(clamped.max_utterance, 120.0)
-        self.assertEqual(clamped.barge_in_echo_threshold, 0.95)
+        self.assertEqual(clamped.barge_in_echo_margin, 10.0)
 
     def test_tts_url_tracks_custom_chat_base(self) -> None:
         args = wake_conversation_runtime.parse_args(
@@ -139,6 +144,64 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
 
         self.assertEqual(selected, english)
         transcribe.assert_called_once()
+
+    def test_pathological_voice_transcripts_are_detected(self) -> None:
+        self.assertTrue(
+            wake_conversation_runtime._is_pathological_transcript(
+                "\u0930\u093e\u0939\u0941\u0932 \u0915\u094b "
+                + "\u0964 " * 30
+            )
+        )
+        self.assertTrue(
+            wake_conversation_runtime._is_pathological_transcript(
+                "\u094c " * 30
+            )
+        )
+        self.assertFalse(
+            wake_conversation_runtime._is_pathological_transcript(
+                "Rahul ko email send karo kal 9 PM milunga"
+            )
+        )
+        self.assertFalse(
+            wake_conversation_runtime._is_pathological_transcript(
+                "\u092d\u093e\u0930\u0924 \u0915\u0947 "
+                "\u0930\u093e\u0937\u094d\u091f\u094d\u0930\u092a\u0924\u093f "
+                "\u0915\u094c\u0928 \u0939\u0948\u0902"
+            )
+        )
+
+    def test_pathological_auto_transcript_runs_bounded_rescue(self) -> None:
+        automatic = TranscriptionResult(
+            "????? ?? " + "? " * 25,
+            "hi",
+            0.95,
+            3.0,
+        )
+        hindi_bad = TranscriptionResult(
+            "? " * 25,
+            "hi",
+            0.90,
+            3.0,
+        )
+        english_good = TranscriptionResult(
+            "Rahul ko email send karo and say I will meet him tomorrow at 9 PM",
+            "en",
+            0.76,
+            3.0,
+        )
+
+        with patch.object(
+            wake_conversation_runtime,
+            "transcribe_samples",
+            side_effect=[automatic, hindi_bad, english_good],
+        ) as transcribe:
+            selected = wake_conversation_runtime._transcribe_conversation(
+                np.zeros(48_000, dtype=np.float32),
+                "auto",
+            )
+
+        self.assertEqual(selected, english_good)
+        self.assertEqual(transcribe.call_count, 3)
 
     def test_microphone_runtime_has_no_audio_file_persistence_path(self) -> None:
         source = inspect.getsource(wake_conversation_runtime)

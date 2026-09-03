@@ -44,7 +44,7 @@ class Phase61VoicePolicyTests(unittest.TestCase):
             patch.object(orchestrator, "build_memory_context", return_value="LOCAL CONTEXT"),
             patch.object(
                 orchestrator,
-                "generate_text",
+                "generate_fast_text",
                 return_value=LLMResult(text=payload, provider="groq", model="test"),
             ) as generate,
         ):
@@ -91,7 +91,7 @@ class Phase61VoicePolicyTests(unittest.TestCase):
             patch.object(orchestrator, "build_memory_context", return_value="LOCAL CONTEXT"),
             patch.object(
                 orchestrator,
-                "generate_text",
+                "generate_fast_text",
                 return_value=LLMResult(text=payload, provider="gemini", model="test"),
             ) as generate,
         ):

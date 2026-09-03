@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Final, Literal, Mapping
@@ -34,6 +35,7 @@ from .llm_service import (
     LLMUnavailableError,
     activate_gemini_cooldown,
     generate_groq_text,
+    generate_fast_text,
     generate_text,
     gemini_cooldown_active,
 )
@@ -145,6 +147,16 @@ Behavior rules:
   the tool-routing layer actually handled that request.
 - If a request is ambiguous, answer the most reasonable interpretation without
   unnecessary meta commentary.
+- The CURRENT USER MESSAGE is authoritative. Answer what the user actually said or asked,
+  rather than steering the conversation toward Bunnelby's available tools.
+- For ordinary general conversation, NEVER proactively offer Gmail, email, inbox,
+  Calendar, scheduling, files, terminal commands, or other tool actions unless the
+  CURRENT USER MESSAGE explicitly asks for or directly refers to that capability.
+- A casual personal statement is conversation, not an automation request. Respond naturally
+  to the statement itself. Do not transform it into a productivity task.
+- Do not infer negative traits about the user from statements about another person.
+  Avoid teasing, personal judgments, or invented family characteristics unless the user
+  explicitly asks for playful banter.
 - Bunnelby may receive a trusted local user profile plus bounded recent/relevant conversation
   memory. Use that context naturally. If the profile contains the user's preferred name,
   do not claim that you have no access to their name.
@@ -776,6 +788,27 @@ def terminal_handler(_: str) -> HandlerResult:
     )
 
 
+_COMPLEX_GENERAL_CHAT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:analy[sz]e|research|investigate|architecture|design|"
+    r"debug|diagnose|compare|trade-?offs?|strategy|roadmap|"
+    r"production|security|optimi[sz]e|deep(?:ly)?|detailed|"
+    r"step[- ]by[- ]step|derive|proof|multi[- ]step)\b",
+    re.IGNORECASE,
+)
+
+
+def _general_chat_inference_profile(user_message: str) -> str:
+    text = user_message.strip()
+
+    if len(text) >= 700:
+        return "balanced"
+
+    if _COMPLEX_GENERAL_CHAT_PATTERN.search(text):
+        return "balanced"
+
+    return "fast"
+
+
 def general_chat_handler(user_message: str) -> HandlerResult:
     """Generate a context-aware Bunnelby response with local memory and cloud failover."""
     if _SIMPLE_GREETING_PATTERN.match(user_message):
@@ -787,7 +820,13 @@ def general_chat_handler(user_message: str) -> HandlerResult:
         return HandlerResult(reply=identity_reply, spoken_reply=identity_reply)
 
     local_now = datetime.now().astimezone()
+    total_started = time.perf_counter()
+
+    memory_started = time.perf_counter()
     memory_context = build_memory_context(user_message)
+    memory_ms = (time.perf_counter() - memory_started) * 1000.0
+
+    inference_profile = _general_chat_inference_profile(user_message)
     spoken_language = detect_spoken_language(user_message)
     spoken_output_directive = (
         "Hindi in natural Devanagari. Do not write Roman Hindi in spoken_reply; "
@@ -796,7 +835,15 @@ def general_chat_handler(user_message: str) -> HandlerResult:
         else "English. Do not switch spoken_reply into Hindi or Hinglish."
     )
     try:
-        result = generate_text(
+        generator = (
+            generate_fast_text
+            if inference_profile == "fast"
+            else generate_text
+        )
+
+        generation_started = time.perf_counter()
+
+        result = generator(
             system_instruction=AO_CHAT_SYSTEM_INSTRUCTION,
             user_content=(
                 f"Current local date/time: {local_now.strftime('%A, %B %d, %Y %I:%M %p %Z')}\n"
@@ -804,11 +851,62 @@ def general_chat_handler(user_message: str) -> HandlerResult:
                 f"{memory_context}\n\n"
                 "TRUSTED SPOKEN OUTPUT LANGUAGE FOR THIS TURN:\n"
                 f"{spoken_output_directive}\n\n"
+                "CURRENT TURN POLICY:\n"
+                "This is a general conversational turn. Answer the current user message "
+                "directly. Do not offer unrelated tools or automation. Previous tool history "
+                "must not change the meaning of this request.\n\n"
                 "CURRENT USER MESSAGE (answer this now):\n"
                 f"{user_message}"
             ),
         )
-        return _parse_conversational_output(result.text, user_message)
+
+        generation_ms = (
+            time.perf_counter() - generation_started
+        ) * 1000.0
+
+        parsed = _parse_conversational_output(
+            result.text,
+            user_message,
+        )
+
+        total_ms = (
+            time.perf_counter() - total_started
+        ) * 1000.0
+
+        metadata = dict(parsed.spoken_metadata)
+        metadata.update(
+            {
+                "brain_profile": inference_profile,
+                "brain_provider": result.provider,
+                "brain_model": result.model,
+                "memory_context_chars": len(memory_context),
+                "latency_ms": {
+                    "memory_retrieval": round(memory_ms, 2),
+                    "brain_generation": round(generation_ms, 2),
+                    "general_chat_total": round(total_ms, 2),
+                },
+            }
+        )
+
+        logger.info(
+            "Bunnelby brain profile=%s provider=%s model=%s "
+            "memory_chars=%s generation_ms=%.0f total_ms=%.0f",
+            inference_profile,
+            result.provider,
+            result.model,
+            len(memory_context),
+            generation_ms,
+            total_ms,
+        )
+
+        return HandlerResult(
+            reply=parsed.reply,
+            spoken_reply=parsed.spoken_reply,
+            spoken_metadata=metadata,
+            action_type_override=parsed.action_type_override,
+            approval=parsed.approval,
+        )
+
     except LLMConfigurationError:
         return HandlerResult(
             reply=(

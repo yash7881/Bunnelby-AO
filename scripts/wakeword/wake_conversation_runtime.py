@@ -3,15 +3,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
+import unicodedata
+from collections import deque
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
 import sherpa_onnx
+
+# Windows terminals may default to a legacy code page. Voice transcripts can
+# contain Hindi/Hinglish/Indic Unicode, so console logging must never crash
+# the persistent runtime.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -72,17 +83,36 @@ else:  # Direct script execution adds this directory to sys.path.
 
 DEFAULT_COMMAND_WAIT_SECONDS = 8.0
 DEFAULT_MAX_UTTERANCE_SECONDS = 60.0
-DEFAULT_CONVERSATION_SILENCE_SECONDS = 1.0
+DEFAULT_CONVERSATION_SILENCE_SECONDS = 1.35
 DEFAULT_CONVERSATION_MIN_SPEECH_SECONDS = 0.15
 DEFAULT_API_URL = "http://127.0.0.1:8000/chat"
 DEFAULT_TTS_URL = "http://127.0.0.1:8000/tts"
 DEFAULT_CHAT_TIMEOUT_SECONDS = 90.0
 DEFAULT_TTS_TIMEOUT_SECONDS = 30.0
 DEFAULT_BARGE_IN_GRACE_SECONDS = 0.35
-DEFAULT_BARGE_IN_MIN_SPEECH_SECONDS = 0.20
-DEFAULT_BARGE_IN_ECHO_THRESHOLD = 0.32
+DEFAULT_BARGE_IN_MIN_SPEECH_SECONDS = 0.18
+DEFAULT_BARGE_IN_ECHO_MARGIN = 2.0
 DEFAULT_BARGE_IN_MIN_RMS = 0.008
 READ_SAMPLES = 512
+
+# Barge-in onset detection. Bunnelby knows exactly what it is playing, so the expected
+# level of its own speaker leakage is predicted from the live playback reference and the
+# measured speaker-to-microphone coupling instead of being guessed or correlated.
+BARGE_IN_PREROLL_SECONDS = 0.40
+BARGE_IN_REFERENCE_LOOKBACK_SECONDS = 0.30
+BARGE_IN_MISS_TOLERANCE_FRAMES = 3
+BARGE_IN_MIN_CALIBRATION_FRAMES = 12
+BARGE_IN_COUPLING_RISE = 0.25
+BARGE_IN_COUPLING_RISE_CEILING = 1.35
+BARGE_IN_COUPLING_DRIFT_CEILING = 1.5
+BARGE_IN_COUPLING_FALL = 0.005
+BARGE_IN_INITIAL_COUPLING = 1.0
+BARGE_IN_MAX_COUPLING = 4.0
+BARGE_IN_REFERENCE_FLOOR = 1e-3
+BARGE_IN_VAD_MIN_SPEECH_SECONDS = 0.05
+# Small output blocks keep the cancellation check close to the audio device so a
+# cancelled reply stops within roughly one block instead of one 1024-frame write.
+BARGE_IN_PLAYBACK_BLOCK_FRAMES = 256
 _INDIC_RESCUE_LANGUAGE_CODES = frozenset(
     {"bn", "gu", "kn", "ml", "mr", "pa", "ta", "te", "ur"}
 )
@@ -95,6 +125,18 @@ def _sounddevice():
     except Exception as exc:
         raise RuntimeError("sounddevice/PortAudio is unavailable for live microphone use.") from exc
     return sounddevice
+
+
+UI_EVENT_PREFIX = "BUNNELBY_UI_EVENT "
+
+
+def _emit_ui_event(event: str, **payload: object) -> None:
+    message = {"event": event, **payload}
+    print(
+        UI_EVENT_PREFIX
+        + json.dumps(message, ensure_ascii=False, separators=(",", ":")),
+        flush=True,
+    )
 
 
 @dataclass
@@ -146,6 +188,11 @@ class TurnMetrics:
 
 def _state(controller: VoiceSessionController, transition: VoiceTransition) -> None:
     print(f"State: {transition.current.name} - {transition.reason}")
+    _emit_ui_event(
+        "state",
+        state=transition.current.name.lower(),
+        reason=transition.reason,
+    )
 
 
 def create_conversation_vad(
@@ -153,13 +200,14 @@ def create_conversation_vad(
     *,
     min_silence_seconds: float,
     max_utterance_seconds: float,
+    min_speech_seconds: float = DEFAULT_CONVERSATION_MIN_SPEECH_SECONDS,
 ):
     """Create VAD tuned for post-wake natural commands, not keyword spotting."""
     config = sherpa_onnx.VadModelConfig()
     config.silero_vad.model = str(model_path)
     config.silero_vad.threshold = 0.35
     config.silero_vad.min_silence_duration = min_silence_seconds
-    config.silero_vad.min_speech_duration = DEFAULT_CONVERSATION_MIN_SPEECH_SECONDS
+    config.silero_vad.min_speech_duration = min_speech_seconds
     config.silero_vad.max_speech_duration = max_utterance_seconds
     config.silero_vad.window_size = READ_SAMPLES
     config.sample_rate = SAMPLE_RATE
@@ -379,13 +427,229 @@ def _await_playback_start(handle: PlaybackHandle, timeout: float = 3.0) -> Playb
     return handle.status
 
 
+@dataclass(frozen=True)
+class BargeInOnset:
+    """One accepted barge-in onset plus every microphone frame that produced it.
+
+    ``detected_at`` is the first frame that cleared the self-echo prediction and is the
+    correct anchor for cancellation-latency measurement. ``speech_started_at`` is that
+    moment backdated over the retained pre-roll, so it matches the first sample of
+    ``samples`` and keeps the captured utterance's own timing honest.
+    """
+
+    speech_started_at: float
+    detected_at: float
+    accepted_at: float
+    samples: np.ndarray
+    coupling: float
+
+
+@dataclass
+class BargeInOutcome:
+    """Authoritative record that the runtime, not the audio device, ended playback."""
+
+    utterance: CapturedUtterance | None
+    speech_started_at: float
+    cancellation_latency_ms: float
+    detection_latency_ms: float
+    coupling: float
+
+
+@dataclass
+class BargeInDetector:
+    """Detect real user speech during SPEAKING without triggering on Bunnelby's own audio.
+
+    The discriminator is level-based, not correlation-based. Bunnelby always knows the
+    waveform it is currently playing, so the expected microphone level of its own speaker
+    leakage is ``coupling * reference_level``. ``coupling`` is the speaker-to-microphone
+    gain, learned online from frames that were *not* treated as user speech, so the user's
+    own voice can never raise the bar against itself. A frame only counts as an
+    interruption when it clears that prediction by ``echo_margin``, clears an absolute
+    noise floor, and the VAD agrees it is speech.
+
+    Every observed frame is kept in a short pre-roll ring so the audio that occurred while
+    the onset was still being confirmed is carried into the captured utterance. Without it
+    the first syllable of "Wait" or "Actually" is lost.
+    """
+
+    frame_samples: int = READ_SAMPLES
+    sample_rate: int = SAMPLE_RATE
+    min_speech_seconds: float = DEFAULT_BARGE_IN_MIN_SPEECH_SECONDS
+    min_rms: float = DEFAULT_BARGE_IN_MIN_RMS
+    echo_margin: float = DEFAULT_BARGE_IN_ECHO_MARGIN
+    preroll_seconds: float = BARGE_IN_PREROLL_SECONDS
+    miss_tolerance: int = BARGE_IN_MISS_TOLERANCE_FRAMES
+    min_calibration_frames: int = BARGE_IN_MIN_CALIBRATION_FRAMES
+    coupling: float = BARGE_IN_INITIAL_COUPLING
+
+    _preroll: deque = field(init=False, repr=False)
+    _candidate: list = field(default_factory=list, init=False, repr=False)
+    _candidate_started_at: float | None = field(default=None, init=False, repr=False)
+    _candidate_leading_seconds: float = field(default=0.0, init=False, repr=False)
+    _misses: int = field(default=0, init=False, repr=False)
+    _calibration_frames: int = field(default=0, init=False, repr=False)
+    _calibrated_coupling: float | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.frame_samples = max(1, int(self.frame_samples))
+        frames = max(
+            1,
+            int(round(self.preroll_seconds * self.sample_rate / self.frame_samples)),
+        )
+        self._preroll = deque(maxlen=frames)
+
+    @property
+    def frame_seconds(self) -> float:
+        return self.frame_samples / float(self.sample_rate)
+
+    @property
+    def calibrated(self) -> bool:
+        return self._calibration_frames >= self.min_calibration_frames
+
+    def threshold(self, reference_level: float) -> float:
+        predicted_echo = max(0.0, float(reference_level)) * self.coupling
+        return max(self.min_rms, predicted_echo * self.echo_margin)
+
+    def _reset_candidate(self) -> None:
+        self._candidate = []
+        self._candidate_started_at = None
+        self._candidate_leading_seconds = 0.0
+        self._misses = 0
+
+    def _learn_coupling(self, rms: float, reference_level: float) -> None:
+        """Track the speaker-to-microphone gain from frames that are not user speech.
+
+        A fresh detector is built for every reply, so calibration happens during the
+        grace window at the start of playback: the loudest self-echo frame seen there
+        seeds the estimate. That is far quicker than converging from a pessimistic
+        constant, and it happens while barge-in is disarmed anyway.
+
+        After calibration the estimate drifts only gently, and it refuses to learn from
+        frames far above the current estimate. Unbounded upward adaptation is
+        self-defeating: the user's own voice is by construction the loudest thing in the
+        microphone, so learning from it would ratchet the bar up at exactly the moment it
+        needs to hold still, and the interruption would be swallowed.
+        """
+        if reference_level < BARGE_IN_REFERENCE_FLOOR:
+            return
+        ratio = min(rms / reference_level, BARGE_IN_MAX_COUPLING)
+        if self._calibration_frames == 0:
+            self.coupling = ratio
+        elif not self.calibrated:
+            self.coupling = max(self.coupling, ratio)
+        elif ratio < self.coupling:
+            self.coupling += BARGE_IN_COUPLING_FALL * (ratio - self.coupling)
+        elif ratio <= self.coupling * BARGE_IN_COUPLING_RISE_CEILING:
+            self.coupling += BARGE_IN_COUPLING_RISE * (ratio - self.coupling)
+        ceiling = BARGE_IN_MAX_COUPLING
+        if self._calibrated_coupling is not None:
+            # Post-calibration drift is bounded. Calibration ran while the user was not
+            # yet interrupting, so it is the trustworthy anchor; without this bound a
+            # loud interruption can creep the estimate upward one frame at a time until
+            # it hides itself.
+            ceiling = min(ceiling, self._calibrated_coupling * BARGE_IN_COUPLING_DRIFT_CEILING)
+        self.coupling = min(ceiling, max(0.0, self.coupling))
+        self._calibration_frames += 1
+        if self._calibrated_coupling is None and self.calibrated:
+            self._calibrated_coupling = self.coupling
+
+    def observe(
+        self,
+        frame: np.ndarray,
+        *,
+        reference_level: float,
+        vad_speech: bool,
+        now: float,
+        armed: bool,
+    ) -> BargeInOnset | None:
+        chunk = np.asarray(frame, dtype=np.float32).reshape(-1).copy()
+        rms = (
+            float(np.sqrt(np.mean(np.square(chunk), dtype=np.float64)))
+            if chunk.size
+            else 0.0
+        )
+        eligible = (
+            armed
+            and self.calibrated
+            and bool(vad_speech)
+            and rms >= self.threshold(reference_level)
+        )
+
+        onset: BargeInOnset | None = None
+        if eligible:
+            if self._candidate_started_at is None:
+                self._candidate_started_at = now
+                self._candidate = list(self._preroll)
+                self._candidate_leading_seconds = len(self._candidate) * self.frame_seconds
+            self._candidate.append(chunk)
+            self._misses = 0
+            if now - self._candidate_started_at >= self.min_speech_seconds:
+                samples = (
+                    np.concatenate(self._candidate).astype(np.float32, copy=False)
+                    if self._candidate
+                    else np.empty(0, dtype=np.float32)
+                )
+                onset = BargeInOnset(
+                    speech_started_at=self._candidate_started_at
+                    - self._candidate_leading_seconds,
+                    detected_at=self._candidate_started_at,
+                    accepted_at=now,
+                    samples=samples,
+                    coupling=self.coupling,
+                )
+                self._reset_candidate()
+        elif self._candidate_started_at is not None:
+            # A stop closure inside a real word ("wait", "no") drops below threshold for
+            # one or two frames. Tolerate a bounded dropout and keep the audio, instead of
+            # discarding a genuine interruption mid-word.
+            self._misses += 1
+            self._candidate.append(chunk)
+            if self._misses > self.miss_tolerance:
+                self._reset_candidate()
+        else:
+            self._learn_coupling(rms, reference_level)
+
+        self._preroll.append(chunk)
+        return onset
+
+
+def _playback_reference_level(handle: PlaybackHandle, frames: int) -> float:
+    """Read the current self-audio level, degrading to 0.0 for handles without it."""
+    getter = getattr(handle, "reference_level", None)
+    if getter is None:
+        return 0.0
+    try:
+        return max(0.0, float(getter(frames)))
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+
+
+def _cancelled_playback_result(
+    queued_at: float,
+    started_at: float,
+    finished_at: float,
+) -> PlaybackResult:
+    return PlaybackResult(
+        status=PlaybackStatus.CANCELLED,
+        queued_at=queued_at,
+        started_at=started_at,
+        first_audio_at=None,
+        finished_at=finished_at,
+        frames_played=0,
+        error="playback thread did not confirm cancellation",
+    )
+
+
 def _monitor_playback_for_barge_in(
     stream,
     model_path: Path,
     args,
     handle: PlaybackHandle,
     stats: RuntimeStats,
-) -> tuple[CapturedUtterance | None, PlaybackResult]:
+    *,
+    on_accepted=None,
+    clock=time.monotonic,
+) -> tuple[BargeInOutcome | None, PlaybackResult]:
     if not args.barge_in:
         result = handle.wait(args.tts_playback_timeout)
         if result is None:
@@ -395,15 +659,27 @@ def _monitor_playback_for_barge_in(
             raise RuntimeError("TTS playback did not stop after cancellation.")
         return None, result
 
+    # PortAudio kept filling the persistent input stream while STT, /chat, and TTS ran.
+    # Monitoring must start from live audio, otherwise onset detection is evaluated on
+    # seconds-old frames that cannot possibly line up with what is playing right now.
+    _discard_buffered_microphone(stream)
+
     vad, window_size = create_conversation_vad(
         model_path,
         min_silence_seconds=args.conversation_silence,
         max_utterance_seconds=args.max_utterance,
+        min_speech_seconds=BARGE_IN_VAD_MIN_SPEECH_SECONDS,
+    )
+    detector = BargeInDetector(
+        frame_samples=window_size,
+        sample_rate=SAMPLE_RATE,
+        min_speech_seconds=args.barge_in_min_speech,
+        min_rms=args.barge_in_min_rms,
+        echo_margin=args.barge_in_echo_margin,
     )
     pending = np.empty(0, dtype=np.float32)
-    unexplained_chunks: list[np.ndarray] = []
-    unexplained_started_at: float | None = None
-    playback_started_at = time.monotonic()
+    reference_frames = max(1, int(BARGE_IN_REFERENCE_LOOKBACK_SECONDS * SAMPLE_RATE))
+    playback_started_at = clock()
 
     while not handle.done:
         samples, overflowed = _read_microphone(stream, window_size)
@@ -411,43 +687,61 @@ def _monitor_playback_for_barge_in(
             stats.microphone_overflows += 1
             print("WARNING: microphone input overflow while monitoring barge-in")
         pending = _feed_vad(vad, window_size, pending, samples)
-        now = time.monotonic()
-        rms = float(np.sqrt(np.mean(np.square(samples), dtype=np.float64)))
-        echo_score = handle.echo_score(samples)
-        eligible = (
-            now - playback_started_at >= args.barge_in_grace
-            and vad.is_speech_detected()
-            and rms >= args.barge_in_min_rms
-            and echo_score < args.barge_in_echo_threshold
+        now = clock()
+        onset = detector.observe(
+            samples,
+            reference_level=_playback_reference_level(handle, reference_frames),
+            vad_speech=bool(vad.is_speech_detected()),
+            now=now,
+            armed=(now - playback_started_at) >= args.barge_in_grace,
         )
-
-        if eligible:
-            if unexplained_started_at is None:
-                unexplained_started_at = now
-                unexplained_chunks.clear()
-            unexplained_chunks.append(samples.copy())
-            if now - unexplained_started_at >= args.barge_in_min_speech:
-                handle.cancel()
-                result = handle.wait(5.0)
-                if result is None:
-                    raise RuntimeError("Barge-in cancellation did not stop TTS playback.")
-                initial = np.concatenate(unexplained_chunks).astype(np.float32, copy=False)
-                captured = capture_conversation_turn(
-                    stream,
-                    model_path,
-                    args,
-                    wait_seconds=args.command_wait,
-                    initial_samples=initial,
-                    initial_speech_started_at=unexplained_started_at,
-                )
-                return captured, result
-        else:
-            unexplained_chunks.clear()
-            unexplained_started_at = None
 
         # Completed echo segments are deliberately discarded. Wake matching is never active
         # during SPEAKING, so Bunnelby's own TTS cannot produce a wake event.
         _pop_segments(vad)
+
+        if onset is None:
+            continue
+
+        # Stop the reply first, then move the state machine, then finish capturing. The
+        # cancellation request itself is what makes the outcome authoritative: whatever
+        # terminal status the playback thread publishes afterwards, this was a barge-in.
+        requested_at = clock()
+        handle.cancel()
+        if on_accepted is not None:
+            on_accepted(onset.speech_started_at)
+
+        result = handle.wait(5.0)
+        if result is None:
+            print("WARNING: TTS playback thread did not confirm cancellation within 5s.")
+            result = _cancelled_playback_result(
+                playback_started_at,
+                playback_started_at,
+                clock(),
+            )
+        cancellation_latency_ms = max(
+            0.0, (result.finished_at - requested_at) * 1000.0
+        )
+        detection_latency_ms = max(0.0, (requested_at - onset.detected_at) * 1000.0)
+
+        captured = capture_conversation_turn(
+            stream,
+            model_path,
+            args,
+            wait_seconds=args.command_wait,
+            initial_samples=onset.samples,
+            initial_speech_started_at=onset.speech_started_at,
+        )
+        return (
+            BargeInOutcome(
+                utterance=captured,
+                speech_started_at=onset.speech_started_at,
+                cancellation_latency_ms=cancellation_latency_ms,
+                detection_latency_ms=detection_latency_ms,
+                coupling=onset.coupling,
+            ),
+            result,
+        )
 
     result = handle.wait(1.0)
     if result is None:
@@ -460,6 +754,86 @@ def _emit_metrics(metrics: TurnMetrics) -> None:
     for key, value in asdict(metrics).items():
         rounded[key] = round(value, 2) if isinstance(value, float) else value
     print("BUNNELBY_TURN_METRICS " + json.dumps(rounded, separators=(",", ":")))
+
+
+def _lexical_character_count(text: str) -> int:
+    return sum(
+        1
+        for character in text
+        if unicodedata.category(character)[:1] in {"L", "N"}
+    )
+
+
+def _transcript_units(text: str) -> list[str]:
+    return [
+        item.casefold()
+        for item in re.findall(
+            r"[A-Za-z0-9@._%+\-]+|[\u0900-\u097f]+",
+            text,
+        )
+        if item.strip()
+    ]
+
+
+def _is_pathological_transcript(text: str) -> bool:
+    """Reject obvious ASR hallucination/repetition before it reaches /chat."""
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized:
+        return True
+
+    non_space = [character for character in normalized if not character.isspace()]
+    lexical = _lexical_character_count(normalized)
+
+    if not non_space:
+        return True
+
+    # Examples:
+    #   "? ? ? ? ?..."
+    #   "? ? ? ? ?..."
+    if lexical == 0 and len(non_space) >= 3:
+        return True
+
+    lexical_ratio = lexical / len(non_space)
+
+    # Real words followed by dozens of punctuation hallucinations.
+    if len(non_space) >= 10 and lexical_ratio < 0.45:
+        return True
+
+    units = _transcript_units(normalized)
+    if len(units) >= 6:
+        frequencies: dict[str, int] = {}
+        for unit in units:
+            frequencies[unit] = frequencies.get(unit, 0) + 1
+
+        dominant = max(frequencies.values(), default=0) / len(units)
+        unique_ratio = len(frequencies) / len(units)
+
+        if dominant >= 0.70 and unique_ratio <= 0.35:
+            return True
+
+    return False
+
+
+def _transcription_quality_score(result: TranscriptionResult) -> float:
+    text = str(result.text or "").strip()
+
+    if not text:
+        return -10000.0
+
+    lexical = _lexical_character_count(text)
+    units = _transcript_units(text)
+    unique = len(set(units))
+
+    score = (
+        lexical
+        + unique * 3.0
+        + float(result.language_probability) * 5.0
+    )
+
+    if _is_pathological_transcript(text):
+        score -= 10000.0
+
+    return score
 
 
 def _devanagari_count(text: str) -> int:
@@ -494,24 +868,73 @@ def _transcribe_conversation(samples: np.ndarray, language_mode: str) -> Transcr
         sample_rate=SAMPLE_RATE,
         language=language_mode,
     )
+
+    # Do not ever send obvious Whisper hallucination/repetition directly to Brain.
+    if _is_pathological_transcript(automatic.text):
+        print(
+            "Suspicious STT transcript detected; running bounded multilingual rescue."
+        )
+
+        candidates = [automatic]
+
+        if language_mode == "auto":
+            hindi = transcribe_samples(
+                samples,
+                sample_rate=SAMPLE_RATE,
+                language="hi",
+                hotwords_override=stt_hindi_hotwords(),
+            )
+            candidates.append(hindi)
+
+            english = transcribe_samples(
+                samples,
+                sample_rate=SAMPLE_RATE,
+                language="en",
+            )
+            candidates.append(english)
+
+        selected = max(candidates, key=_transcription_quality_score)
+
+        if not _is_pathological_transcript(selected.text):
+            print(
+                "STT rescue selected a higher-quality transcript "
+                f"(language={selected.language})."
+            )
+            return selected
+
+        print(
+            "All STT candidates failed transcript-quality checks; "
+            "nothing will be dispatched to Brain."
+        )
+
+        return TranscriptionResult(
+            text="",
+            language=automatic.language,
+            language_probability=automatic.language_probability,
+            duration_seconds=automatic.duration_seconds,
+        )
+
+    # Preserve the established low-confidence Indic rescue path.
     if not _needs_hindi_rescue(automatic, language_mode):
         return automatic
 
     print(
         "Low-confidence Indic auto-detection; running one bounded Hindi rescue inference."
     )
+
     hindi = transcribe_samples(
         samples,
         sample_rate=SAMPLE_RATE,
         language="hi",
         hotwords_override=stt_hindi_hotwords(),
     )
+
     if _prefer_hindi_rescue(automatic, hindi):
         print("Hindi rescue selected by language-confidence/script policy.")
         return hindi
+
     print("Hindi rescue rejected; retaining the original auto transcript.")
     return automatic
-
 
 def _env_follow_up_seconds() -> float:
     raw = os.getenv("FOLLOW_UP_SECONDS", "").strip()
@@ -530,7 +953,9 @@ def _standby_after_failure(
 ) -> None:
     controller.recover(reason)
     print(f"Recovered safely: {reason}")
-    print("State: STANDBY - say 'Hey Bunnelby'")
+    print("State: STANDBY - say 'Hey Bunnelby' or 'Hello Bunnelby'")
+    _emit_ui_event("runtime_error", message=reason)
+    _emit_ui_event("state", state="standby", reason="safe recovery")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -539,7 +964,17 @@ def run(args: argparse.Namespace) -> int:
     device_index, device = default_microphone(args.device)
     stats = RuntimeStats()
     controller = VoiceSessionController(follow_up_seconds=args.follow_up_seconds)
-    player = SoundDeviceWavPlayer(output_device=args.output_device)
+    player = SoundDeviceWavPlayer(
+        output_device=args.output_device,
+        block_frames=BARGE_IN_PLAYBACK_BLOCK_FRAMES,
+    )
+
+    def accept_barge_in(speech_started_at: float) -> None:
+        """Move SPEAKING -> LISTENING the moment cancellation is requested."""
+        stats.barge_ins += 1
+        _state(controller, controller.barge_in(speech_started_at=speech_started_at))
+        print("Barge-in accepted; TTS playback cancelled.")
+
     stt_profile = stt_runtime_profile()
 
     print()
@@ -560,12 +995,23 @@ def run(args: argparse.Namespace) -> int:
         f"Hindi={edge_voice_name('hi') if preferred_provider() == 'edge' else voice_name('hi')}"
     )
     print(f"Follow-up window: {args.follow_up_seconds:.1f}s after playback completes")
-    print(f"Barge-in monitor: {'ENABLED' if args.barge_in else 'DISABLED'}")
+    print(
+        f"Barge-in monitor: {'ENABLED' if args.barge_in else 'DISABLED'} "
+        f"grace={args.barge_in_grace:.2f}s confirm={args.barge_in_min_speech:.2f}s "
+        f"echo-margin={args.barge_in_echo_margin:.2f}x floor={args.barge_in_min_rms:.3f}"
+    )
     print(f"Post-wake trailing silence: {args.conversation_silence:.2f}s")
     print(f"Maximum one-turn speech: {args.max_utterance:.0f}s")
     print(f"Dispatch to /chat: {'YES' if args.dispatch else 'NO'}")
     print("Privacy: raw microphone audio saved = NO")
-    print("State: STANDBY - say 'Hey Bunnelby'")
+    print("State: STANDBY - say 'Hey Bunnelby' or 'Hello Bunnelby'")
+    _emit_ui_event(
+        "runtime_ready",
+        wake_phrases=["Hey Bunnelby", "Hello Bunnelby"],
+        raw_audio_saved=False,
+        tts_provider=preferred_provider(),
+    )
+    _emit_ui_event("state", state="standby", reason="runtime ready")
     print()
 
     next_audio: CapturedUtterance | None = None
@@ -597,6 +1043,11 @@ def run(args: argparse.Namespace) -> int:
                         continue
                     print()
                     print(f"WAKE DETECTED: {wake_text!r} ({wake_latency:.2f}s ASR)")
+                    _emit_ui_event(
+                        "wake_detected",
+                        transcript=wake_text,
+                        latency_seconds=round(wake_latency, 4),
+                    )
                     _state(controller, controller.wake_detected())
                     _state(controller, controller.begin_listening())
                     pending_wake_latency_ms = wake_latency * 1000.0
@@ -610,7 +1061,12 @@ def run(args: argparse.Namespace) -> int:
                         stats.empty_turns += 1
                         controller.transition(VoiceState.STANDBY, "no command after wake")
                         print("No command began before timeout.")
-                        print("State: STANDBY - say 'Hey Bunnelby'")
+                        print("State: STANDBY - say 'Hey Bunnelby' or 'Hello Bunnelby'")
+                        _emit_ui_event(
+                            "state",
+                            state="standby",
+                            reason="no command after wake",
+                        )
                         continue
 
                 if controller.state is VoiceState.FOLLOW_UP:
@@ -626,7 +1082,15 @@ def run(args: argparse.Namespace) -> int:
                         stats.follow_up_timeouts += 1
                         controller.expire_follow_up(at=time.monotonic())
                         print("Follow-up window expired.")
-                        print("State: STANDBY - next interaction requires 'Hey Bunnelby'")
+                        print(
+                            "State: STANDBY - next interaction requires "
+                            "'Hey Bunnelby' or 'Hello Bunnelby'"
+                        )
+                        _emit_ui_event(
+                            "state",
+                            state="standby",
+                            reason="follow-up window expired",
+                        )
                         pending_wake_latency_ms = None
                         continue
                     if not controller.accept_follow_up_speech(next_audio.speech_started_at):
@@ -678,6 +1142,12 @@ def run(args: argparse.Namespace) -> int:
                     f"(confidence={result.language_probability:.3f})"
                 )
                 print("Raw audio saved: NO")
+                _emit_ui_event(
+                    "user_transcript",
+                    text=transcript,
+                    language=result.language,
+                    language_probability=round(result.language_probability, 4),
+                )
                 _state(controller, controller.transcription_completed())
                 next_audio = None
 
@@ -715,6 +1185,14 @@ def run(args: argparse.Namespace) -> int:
                     spoken_language = "hi" if result.language == "hi" else "en"
                 print(f"Assistant reply: {reply or '[empty]'}")
                 print(f"Spoken reply: {spoken or '[empty]'}")
+                _emit_ui_event(
+                    "assistant_response",
+                    reply=reply,
+                    spoken_reply=spoken,
+                    spoken_language=spoken_language,
+                    approval=response.get("approval"),
+                    action_type=response.get("action_type"),
+                )
 
                 if not args.tts or not spoken:
                     transition = controller.response_completed_without_tts(at=time.monotonic())
@@ -740,12 +1218,13 @@ def run(args: argparse.Namespace) -> int:
                         if start_status is PlaybackStatus.STARTED:
                             _state(controller, controller.speaking_started())
                             try:
-                                barge_audio, playback = _monitor_playback_for_barge_in(
+                                barge_outcome, playback = _monitor_playback_for_barge_in(
                                     microphone,
                                     model_path,
                                     args,
                                     handle,
                                     stats,
+                                    on_accepted=accept_barge_in,
                                 )
                             except RuntimeError as exc:
                                 handle.cancel()
@@ -754,10 +1233,11 @@ def run(args: argparse.Namespace) -> int:
                                 failure_at = (
                                     playback.finished_at if playback else time.monotonic()
                                 )
-                                _state(
-                                    controller,
-                                    controller.playback_failed(at=failure_at),
-                                )
+                                if controller.state is VoiceState.SPEAKING:
+                                    _state(
+                                        controller,
+                                        controller.playback_failed(at=failure_at),
+                                    )
                                 print(
                                     "Playback monitoring failed safely; screen reply remains "
                                     f"available: {exc}"
@@ -775,16 +1255,39 @@ def run(args: argparse.Namespace) -> int:
                                     (playback.first_audio_at - tts_started_at) * 1000.0,
                                 )
 
-                            if barge_audio is not None and playback.status is PlaybackStatus.CANCELLED:
-                                stats.barge_ins += 1
-                                _state(
-                                    controller,
-                                    controller.barge_in(
-                                        speech_started_at=barge_audio.speech_started_at
-                                    ),
+                            # The barge-in outcome, not the playback status, decides the
+                            # next state. A "completed" result that lands after the runtime
+                            # already cancelled is a late callback from a race the user has
+                            # already won, and must never rewrite LISTENING into FOLLOW_UP.
+                            if barge_outcome is not None:
+                                print(
+                                    "Barge-in cancellation latency: "
+                                    f"{barge_outcome.cancellation_latency_ms:.0f} ms "
+                                    f"(onset to cancel {barge_outcome.detection_latency_ms:.0f} ms, "
+                                    f"self-echo coupling {barge_outcome.coupling:.2f})"
                                 )
-                                print("Barge-in accepted; TTS playback cancelled.")
-                                next_audio = barge_audio
+                                next_audio = barge_outcome.utterance
+                                if next_audio is None:
+                                    controller.transition(
+                                        VoiceState.STANDBY,
+                                        "barge-in produced no utterance",
+                                    )
+                                    stats.empty_turns += 1
+                                    print("Barge-in produced no usable utterance.")
+                                    print(
+                                        "State: STANDBY - say 'Hey Bunnelby' or "
+                                        "'Hello Bunnelby'"
+                                    )
+                                    _emit_ui_event(
+                                        "state",
+                                        state="standby",
+                                        reason="barge-in produced no utterance",
+                                    )
+                            elif controller.state is not VoiceState.SPEAKING:
+                                print(
+                                    "Late playback result ignored; runtime already left "
+                                    f"SPEAKING ({playback.status.value})."
+                                )
                             elif playback.status is PlaybackStatus.COMPLETED:
                                 _state(
                                     controller,
@@ -896,9 +1399,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_BARGE_IN_MIN_SPEECH_SECONDS,
     )
     parser.add_argument(
-        "--barge-in-echo-threshold",
+        "--barge-in-echo-margin",
         type=float,
-        default=DEFAULT_BARGE_IN_ECHO_THRESHOLD,
+        default=DEFAULT_BARGE_IN_ECHO_MARGIN,
+        help=(
+            "How far above Bunnelby's measured self-echo level a microphone frame must "
+            "rise before it counts as a real interruption."
+        ),
     )
     parser.add_argument("--barge-in-min-rms", type=float, default=DEFAULT_BARGE_IN_MIN_RMS)
     parser.add_argument("--debug-wake-transcripts", action="store_true")
@@ -913,9 +1420,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.tts_playback_timeout = max(10.0, min(float(args.tts_playback_timeout), 300.0))
     args.barge_in_grace = max(0.0, min(float(args.barge_in_grace), 2.0))
     args.barge_in_min_speech = max(0.10, min(float(args.barge_in_min_speech), 1.0))
-    args.barge_in_echo_threshold = max(
-        0.05, min(float(args.barge_in_echo_threshold), 0.95)
-    )
+    args.barge_in_echo_margin = max(1.2, min(float(args.barge_in_echo_margin), 10.0))
     args.barge_in_min_rms = max(0.001, min(float(args.barge_in_min_rms), 0.25))
     if args.tts_url is None:
         args.tts_url = (

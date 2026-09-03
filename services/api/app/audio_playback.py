@@ -151,6 +151,32 @@ class PlaybackHandle:
     def cancellation_requested(self) -> bool:
         return self._cancel.is_set()
 
+    def reference_level(self, frames: int, *, window: int = 512) -> float:
+        """Loudest short-window RMS of recently submitted output, in reference units.
+
+        Barge-in needs to know how loud Bunnelby itself currently is so the expected
+        level of speaker leakage into the microphone can be predicted instead of guessed.
+        Two details matter. The measurement window matches a microphone frame, so the
+        result is directly comparable to a single microphone frame's RMS rather than
+        conflating speech envelope dynamics into the comparison. And the maximum over a
+        short lookback is returned rather than the mean, because the acoustic path adds
+        an unknown few tens of milliseconds of delay: the loudest recent output is the
+        conservative estimate of what the microphone is hearing right now.
+        """
+        span = max(1, int(frames))
+        step = max(1, min(int(window), span))
+        with self._lock:
+            cursor = int(
+                round(self._frames_played * self._reference_rate / self.decoded.sample_rate)
+            )
+        end = min(max(0, cursor), int(self._reference.size))
+        start = max(0, end - span)
+        if end - start < step:
+            return 0.0
+        usable = ((end - start) // step) * step
+        recent = self._reference[end - usable : end].reshape(-1, step)
+        return float(np.sqrt(np.max(np.mean(np.square(recent, dtype=np.float64), axis=1))))
+
     def _mark_started(self) -> None:
         with self._lock:
             self._started_at = self._clock()
@@ -166,7 +192,19 @@ class PlaybackHandle:
             self._frames_played += int(output_frames)
 
     def _finish(self, status: PlaybackStatus, error: str | None = None) -> None:
+        """Publish the single terminal lifecycle result for this playback.
+
+        Two ordering rules matter for barge-in. The first terminal result wins, so a
+        late callback can never rewrite an already-published outcome. And once
+        cancellation has been requested the playback is reported as CANCELLED even if
+        the writer happened to drain its final block first: the runtime asked for the
+        reply to stop, so the turn must not be reported as a completed answer.
+        """
         with self._lock:
+            if self._finished_at is not None:
+                return
+            if self._cancel.is_set() and status is PlaybackStatus.COMPLETED:
+                status = PlaybackStatus.CANCELLED
             self._status = status
             self._error = error
             self._finished_at = self._clock()
@@ -192,6 +230,12 @@ class PlaybackHandle:
         This is a conservative self-echo gate, not acoustic echo cancellation. It prevents
         obvious speaker feedback from being treated as barge-in while retaining an explicit
         live-device acceptance gate for overlapping user speech.
+
+        NOTE: this is deliberately NOT used to gate barge-in onset detection. Over a 32 ms
+        microphone window the best-of-many-lags normalized correlation is strongly biased
+        upward for any voiced audio, so it scores unrelated user speech about as highly as
+        genuine echo and provides no usable separation at that window length. Barge-in uses
+        the level-based prediction built on `reference_level()` instead.
         """
         microphone = np.asarray(microphone_samples, dtype=np.float32).reshape(-1)
         if microphone.size < 32:
@@ -299,7 +343,12 @@ class SoundDeviceWavPlayer:
                     stream.abort()
                 except Exception:
                     pass
-            handle._finish(PlaybackStatus.FAILED, str(exc))
+            if handle.cancellation_requested():
+                # A device error raised while tearing down a cancelled reply is still a
+                # cancellation from the runtime's point of view, never a failed answer.
+                handle._finish(PlaybackStatus.CANCELLED)
+            else:
+                handle._finish(PlaybackStatus.FAILED, str(exc))
         finally:
             if stream is not None:
                 try:

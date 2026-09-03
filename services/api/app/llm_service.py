@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from google import genai
-from google.genai import errors
+from google.genai import errors, types
 
 from .database import PROJECT_ROOT
 
@@ -24,6 +24,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 Provider = Literal["gemini", "groq"]
 
 DEFAULT_GEMINI_MODEL: Final[str] = "gemini-3.6-flash"
+DEFAULT_GEMINI_FAST_MODEL: Final[str] = "gemini-3.5-flash-lite"
 DEFAULT_GROQ_MODEL: Final[str] = "llama-3.3-70b-versatile"
 DEFAULT_GEMINI_COOLDOWN_SECONDS: Final[int] = 900
 DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[int] = 45
@@ -85,6 +86,13 @@ def _validate_fixed_groq_endpoint() -> None:
 
 def gemini_model_name() -> str:
     return os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+
+
+def gemini_fast_model_name() -> str:
+    return (
+        os.getenv("GEMINI_FAST_MODEL", DEFAULT_GEMINI_FAST_MODEL).strip()
+        or DEFAULT_GEMINI_FAST_MODEL
+    )
 
 
 def groq_model_name() -> str:
@@ -165,6 +173,76 @@ def _gemini_generate(
         # so repeated requests do not stall on the same failing primary provider.
         activate_gemini_cooldown(type(exc).__name__)
         raise LLMUnavailableError("Gemini request failed before a usable response arrived.") from exc
+    finally:
+        client.close()
+
+
+def _gemini_generate_fast(
+    system_instruction: str,
+    user_content: str,
+) -> LLMResult:
+    """Latency-first Gemini path for ordinary conversational turns.
+
+    Uses Flash-Lite with minimal reasoning. Complex reasoning continues through
+    the established balanced Gemini path instead of sacrificing quality.
+    """
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise LLMConfigurationError("GEMINI_API_KEY is not configured.")
+
+    model = gemini_fast_model_name()
+    client = genai.Client(api_key=api_key)
+
+    try:
+        response = client.models.generate_content(
+            model=model,
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2,
+                thinking_config=types.ThinkingConfig(
+                    thinking_level="minimal"
+                ),
+            ),
+        )
+
+        text = (getattr(response, "text", None) or "").strip()
+        if not text:
+            raise LLMUnavailableError("Fast Gemini returned an empty response.")
+
+        return LLMResult(
+            text=text,
+            provider="gemini",
+            model=model,
+        )
+
+    except errors.APIError as exc:
+        code = int(getattr(exc, "code", 0) or 0)
+
+        if code in RECOVERABLE_GEMINI_CODES:
+            activate_gemini_cooldown(
+                f"fast Gemini HTTP {code or 'unknown'}"
+            )
+            raise LLMUnavailableError(
+                f"Fast Gemini is temporarily unavailable "
+                f"(HTTP {code or 'unknown'})."
+            ) from exc
+
+        raise LLMUnavailableError(
+            f"Fast Gemini request failed (HTTP {code or 'unknown'})."
+        ) from exc
+
+    except LLMServiceError:
+        raise
+
+    except Exception as exc:
+        activate_gemini_cooldown(
+            f"fast Gemini {type(exc).__name__}"
+        )
+        raise LLMUnavailableError(
+            "Fast Gemini request failed before a usable response arrived."
+        ) from exc
+
     finally:
         client.close()
 
@@ -260,6 +338,67 @@ def generate_groq_text(
         raise
     except Exception as exc:
         raise LLMUnavailableError("Groq request failed before a usable response arrived.") from exc
+
+
+def generate_fast_text(
+    *,
+    system_instruction: str,
+    user_content: str,
+) -> LLMResult:
+    """Low-latency conversational generation with safe cloud failover."""
+    failures: list[str] = []
+
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+
+    if gemini_key and not gemini_cooldown_active():
+        try:
+            result = _gemini_generate_fast(
+                system_instruction,
+                user_content,
+            )
+            clear_gemini_cooldown()
+            logger.info(
+                "AO LLM profile=fast provider=gemini model=%s",
+                result.model,
+            )
+            return result
+        except LLMServiceError as exc:
+            failures.append(str(exc))
+            logger.warning(
+                "Fast Gemini generation failed; attempting Groq fallback: %s",
+                exc,
+            )
+
+    elif gemini_key:
+        failures.append(
+            f"Gemini cooldown active "
+            f"({gemini_cooldown_remaining_seconds()}s remaining)."
+        )
+    else:
+        failures.append("Gemini is not configured.")
+
+    if groq_key:
+        try:
+            result = generate_groq_text(
+                system_instruction=system_instruction,
+                user_content=user_content,
+                temperature=0.2,
+            )
+            logger.info(
+                "AO LLM profile=fast-fallback provider=groq model=%s",
+                result.model,
+            )
+            return result
+        except LLMServiceError as exc:
+            failures.append(str(exc))
+
+    if not gemini_key and not groq_key:
+        raise LLMConfigurationError(
+            "No cloud LLM provider is configured."
+        )
+
+    raise LLMUnavailableError("; ".join(failures))
 
 
 def generate_text(
