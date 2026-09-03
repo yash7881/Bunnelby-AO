@@ -669,8 +669,25 @@ def parse_calendar_request(
     *,
     now: datetime | None = None,
     timezone: ZoneInfo | None = None,
+    force_action: CalendarAction | None = None,
+    fallback_title: str | None = None,
+    fallback_duration_minutes: int | None = None,
 ) -> ParsedCalendarRequest:
-    """Deterministically parse common Calendar requests; fail closed when exact scheduling is ambiguous."""
+    """Deterministically parse common Calendar requests; fail closed when exact scheduling is ambiguous.
+
+    `force_action` is the Part 10.2 Phase G hinge. Left unset the parser behaves
+    exactly as before and derives the action class from the wording -- the legacy
+    text-routed path. When the Brain has already chosen the class, the caller
+    passes it here and the wording may then only fill in FIELDS (date, clock,
+    title, duration, attendees). A create can no longer decay into a free/busy
+    read, and read vocabulary such as "book" or "schedule" inside an availability
+    question can no longer promote itself into a create.
+
+    `fallback_title` / `fallback_duration_minutes` carry validated request data
+    the Brain already supplied, for the case where the deterministic extractors
+    cannot recover them from the wording ("put the dentist appointment on my
+    calendar" has no create verb for _extract_title to anchor on).
+    """
     text = user_message.strip()
     if not text:
         raise CalendarParseError("A calendar request is required.")
@@ -680,11 +697,18 @@ def parse_calendar_request(
     target_day = _extract_date(text, current)
     explicit_clock = _extract_clock(text)
     daypart = _extract_daypart(text)
-    parsed_duration = _extract_duration(text)
+    parsed_duration = _extract_duration(text) or fallback_duration_minutes
     attendees = _extract_attendees(text)
 
-    if _is_create_request(text):
-        title = _extract_title(text)
+    if force_action is None:
+        wants_create = _is_create_request(text)
+        wants_open_slots = _is_open_slot_request(text)
+    else:
+        wants_create = force_action == "create_event"
+        wants_open_slots = force_action == "open_slots"
+
+    if wants_create:
+        title = _extract_title(text) or (fallback_title or "").strip() or None
         if not title:
             raise CalendarParseError("Tell me the event title before I prepare a calendar creation approval.")
         if explicit_clock is None:
@@ -710,7 +734,7 @@ def parse_calendar_request(
             daypart=daypart,
         )
 
-    if _is_open_slot_request(text):
+    if wants_open_slots:
         duration = parsed_duration or DEFAULT_SLOT_DURATION_MINUTES
         assumed = parsed_duration is None
         work_hours = DAYPART_HOURS.get(daypart or "", DEFAULT_WORK_HOURS)

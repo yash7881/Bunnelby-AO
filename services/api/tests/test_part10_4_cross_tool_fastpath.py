@@ -154,8 +154,10 @@ class CrossToolFastPathTests(unittest.TestCase):
         )
         with (
             patch.dict("os.environ", {"GROQ_API_KEY": "test-key"}, clear=False),
+            # Part 10.2 Phase E: provider order is now gateway policy, not a
+            # call-site decision, so assert the profile the module asks for.
             patch(
-                "services.api.app.cross_tool_fastpath.generate_groq_text",
+                "services.api.app.model_gateway.generate",
                 return_value=model_result,
             ) as groq,
             patch("services.api.app.cross_tool_fastpath.synthesize_results") as standard,
@@ -177,7 +179,7 @@ class CrossToolFastPathTests(unittest.TestCase):
         with (
             patch.dict("os.environ", {"GROQ_API_KEY": "test-key"}, clear=False),
             patch(
-                "services.api.app.cross_tool_fastpath.generate_groq_text",
+                "services.api.app.model_gateway.generate",
                 side_effect=LLMUnavailableError("forced failure"),
             ),
             patch(
@@ -203,7 +205,7 @@ class CrossToolFastPathTests(unittest.TestCase):
                 "services.api.app.cross_tool_fastpath.synthesize_results",
                 return_value=("standard", "standard spoken"),
             ) as standard,
-            patch("services.api.app.cross_tool_fastpath.generate_groq_text") as groq,
+            patch("services.api.app.model_gateway.generate") as groq,
         ):
             reply, spoken, provider = _synthesize_low_latency(
                 "read Gmail and check calendar",

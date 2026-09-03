@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from google import genai
 
-from .llm_service import (
+from .provider_config import (
     GROQ_API_HOST,
     GROQ_MODELS_URL,
     gemini_fast_model_name,

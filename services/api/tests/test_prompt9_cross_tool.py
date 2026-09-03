@@ -160,7 +160,8 @@ class Prompt9CrossToolTests(unittest.TestCase):
         ):
             result = intelligence_dispatch.handle_message_result(EXAMPLE)
 
-        legacy.assert_called_once_with(EXAMPLE)
+        # Part 10.2 Phase D: the facade now forwards the active session id too.
+        legacy.assert_called_once_with(EXAMPLE, session_id=None, turn_id=None)
         cross_tool.assert_not_called()
         self.assertIs(result, sentinel)
 

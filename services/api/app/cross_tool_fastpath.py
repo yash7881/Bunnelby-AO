@@ -23,7 +23,8 @@ from .cross_tool_reasoning import (
     synthesize_results,
 )
 from .gmail_fast_read import gmail_read_fast_executor
-from .llm_service import LLMServiceError, generate_groq_text
+from .llm_service import LLMServiceError
+from . import model_gateway
 from .tool_registry import ToolRegistry, ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -205,9 +206,10 @@ def _synthesize_low_latency(
         return reply, spoken, "standard"
 
     try:
-        result = generate_groq_text(
+        result = model_gateway.generate(
             system_instruction=SYNTHESIS_SYSTEM_INSTRUCTION,
             user_content=_synthesis_envelope(user_message, plan, steps),
+            profile_name="low_latency_synthesis",
             temperature=0.2,
         )
         parsed = _safe_json_from_model(result.text)

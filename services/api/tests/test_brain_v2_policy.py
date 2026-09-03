@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ from services.api.app import (
     memory_service,
     message_dispatch,
     orchestrator,
+    tool_execution,
     tool_executor,
 )
 from services.api.app.database import Base
@@ -23,37 +25,56 @@ from services.api.app.models import Message
 
 
 class BrainV2RoutingTests(unittest.TestCase):
-    def test_casual_family_statement_is_general_chat(self) -> None:
-        samples = (
-            "my brother is too lazy",
-            "mera bhai bahut lazy hai",
-            "my brother is very lazy today",
-            "bhai aaj kuch kaam nahi kar raha",
-        )
+    """Part 10.2 Phase M: there is exactly one routing authority.
 
-        for sample in samples:
-            decision = orchestrator._local_pre_route(sample)
-            self.assertIsNotNone(decision)
-            self.assertEqual(
-                decision.intent,
-                "general_chat",
-                sample,
+    Two tests here previously asserted on orchestrator._local_pre_route -- the
+    legacy keyword pre-router, which had no production caller once brain-first
+    dispatch landed and has now been removed. Their semantic intent ("a casual
+    personal statement is conversation; an explicit inbox/calendar request
+    routes to a tool") is covered against the LIVE authority by
+    BrainAgentDecisionTests and LiveBugCrossToolGateRegressionTests below.
+    What remains here is the structural guarantee those tests can no longer give.
+    """
+
+    LEGACY_ROUTER_SYMBOLS = (
+        "_local_pre_route",
+        "classify_intent",
+        "_classify_intent_with_groq",
+        "handle_message_result",
+        "handle_message",
+        "HANDLERS",
+        "calendar_handler",
+        "file_search_handler",
+        "terminal_handler",
+        "_log_task",
+        "SYSTEM_INSTRUCTION",
+        "GROQ_ROUTING_SYSTEM_INSTRUCTION",
+        "ROUTING_CONFIG",
+        "RoutingDecision",
+    )
+
+    def test_the_legacy_keyword_router_is_gone(self) -> None:
+        for symbol in self.LEGACY_ROUTER_SYMBOLS:
+            self.assertFalse(
+                hasattr(orchestrator, symbol),
+                f"orchestrator.{symbol} is dead legacy routing and must not return",
             )
 
-    def test_explicit_tools_still_route_to_tools(self) -> None:
-        self.assertEqual(
-            orchestrator._local_pre_route(
-                "check my unread emails"
-            ).intent,
-            "gmail",
-        )
+    def test_the_only_routing_authority_is_the_brain(self) -> None:
+        # message_dispatch is the single entry point, and it reaches exactly one
+        # decision function before dispatching to the typed executor.
+        source = pathlib.Path(message_dispatch.__file__).read_text(encoding="utf-8")
+        self.assertIn("brain_agent.decide(user_message", source)
+        self.assertIn("tool_executor.execute(", source)
+        for legacy in ("_local_pre_route", "classify_intent", "HANDLERS["):
+            self.assertNotIn(legacy, source)
 
-        self.assertEqual(
-            orchestrator._local_pre_route(
-                "show my calendar tomorrow"
-            ).intent,
-            "calendar",
-        )
+    def test_orchestrator_retains_only_result_schemas_and_isolated_helpers(self) -> None:
+        # What is deliberately kept: the result dataclasses every caller uses,
+        # the persona re-exports, and two legacy handlers still exercised by
+        # tests but reachable from no production path.
+        for kept in ("OrchestratorResult", "HandlerResult", "AO_CHAT_SYSTEM_INSTRUCTION"):
+            self.assertTrue(hasattr(orchestrator, kept), kept)
 
     def test_simple_chat_uses_fast_profile(self) -> None:
         self.assertEqual(
@@ -564,7 +585,7 @@ class LiveBugRecencyResolutionTests(unittest.TestCase):
     ) -> tuple[brain_agent.BrainDecision, dict]:
         captured: dict = {}
 
-        def _fake_generate(system_instruction: str, user_content: str):
+        def _fake_generate(system_instruction: str, user_content: str, **_kwargs):
             captured["system_instruction"] = system_instruction
             captured["user_content"] = user_content
             return _fake_llm_result(payload)
@@ -723,13 +744,13 @@ class LiveBugRecencyResolutionTests(unittest.TestCase):
         ), patch.object(
             brain_agent, "generate_text", return_value=_fake_llm_result(payload)
         ), patch.object(
-            tool_executor, "gmail_handler"
+            tool_execution, "execute_gmail_read"
         ) as gmail_handler, patch.object(
             tool_executor, "execute"
         ) as tool_execute, patch.object(
-            message_dispatch, "_calendar_result"
+            tool_execution, "execute_calendar_read"
         ) as calendar_result, patch.object(
-            message_dispatch, "_calendar_agenda_result"
+            tool_execution, "execute_calendar_create"
         ) as calendar_agenda_result, patch.object(
             tool_executor, "handle_cross_tool_fast_request"
         ) as cross_tool_fast_request:
@@ -819,7 +840,7 @@ class CollectionReferenceResolutionTests(unittest.TestCase):
     ) -> tuple[brain_agent.BrainDecision, dict]:
         captured: dict = {}
 
-        def _fake_generate(system_instruction: str, user_content: str):
+        def _fake_generate(system_instruction: str, user_content: str, **_kwargs):
             captured["system_instruction"] = system_instruction
             captured["user_content"] = user_content
             return _fake_llm_result(payload)
@@ -833,13 +854,13 @@ class CollectionReferenceResolutionTests(unittest.TestCase):
     def _assert_no_tool_reexecution(self, decision: brain_agent.BrainDecision, message: str) -> None:
         """Dispatch `decision` through message_dispatch and prove no tool re-fetch happens."""
         with patch.object(brain_agent, "decide", return_value=decision), patch.object(
-            tool_executor, "gmail_handler"
+            tool_execution, "execute_gmail_read"
         ) as gmail_handler, patch.object(
             tool_executor, "execute"
         ) as tool_execute, patch.object(
-            message_dispatch, "_calendar_result"
+            tool_execution, "execute_calendar_read"
         ) as calendar_result, patch.object(
-            message_dispatch, "_calendar_agenda_result"
+            tool_execution, "execute_calendar_create"
         ) as calendar_agenda_result, patch.object(
             tool_executor, "handle_cross_tool_fast_request"
         ) as cross_tool_fast_request:
@@ -1029,11 +1050,11 @@ class LiveBugCrossToolGateRegressionTests(unittest.TestCase):
         ), patch.object(
             brain_agent, "generate_text", return_value=_fake_llm_result(payload)
         ), patch.object(
-            tool_executor, "gmail_handler"
+            tool_execution, "execute_gmail_read"
         ) as gmail_handler, patch.object(
-            message_dispatch, "_calendar_result"
+            tool_execution, "execute_calendar_read"
         ) as calendar_result, patch.object(
-            message_dispatch, "_calendar_agenda_result"
+            tool_execution, "execute_calendar_create"
         ) as calendar_agenda_result, patch.object(
             tool_executor, "handle_cross_tool_fast_request"
         ) as cross_tool_fast_request:
@@ -1175,9 +1196,9 @@ class LiveBugCrossToolGateRegressionTests(unittest.TestCase):
         ), patch.object(
             tool_executor, "handle_cross_tool_fast_request", return_value=fake_result
         ) as cross_tool_fast_request, patch.object(
-            tool_executor, "gmail_handler"
+            tool_execution, "execute_gmail_read"
         ) as gmail_handler, patch.object(
-            message_dispatch, "_calendar_result"
+            tool_execution, "execute_calendar_read"
         ) as calendar_result:
             result = intelligence_dispatch.handle_message_result(
                 "Check my latest emails and what's on my calendar tomorrow."
@@ -1231,9 +1252,13 @@ class LiveBugCrossToolGateRegressionTests(unittest.TestCase):
             "spoken_reply": "",
             "reason": "explicit read",
         }
+        # Phase G: the typed gmail_read executor returns an OrchestratorResult
+        # directly, so this double carries action_type instead of the old
+        # HandlerResult's action_type_override that tool_executor used to wrap.
         fake_handler_result = SimpleNamespace(
             reply="You have two unread messages.",
-            action_type_override=None,
+            action_type="gmail_summary",
+            memory_content="You have two unread messages.",
             spoken_reply="You have two unread messages, sir.",
             spoken_metadata=None,
             approval=None,
@@ -1243,7 +1268,7 @@ class LiveBugCrossToolGateRegressionTests(unittest.TestCase):
         ), patch.object(
             brain_agent, "generate_text", return_value=_fake_llm_result(payload)
         ), patch.object(
-            tool_executor, "gmail_handler", return_value=fake_handler_result
+            tool_execution, "execute_gmail_read", return_value=fake_handler_result
         ) as gmail_handler, patch.object(
             tool_executor, "handle_cross_tool_fast_request"
         ) as cross_tool_fast_request:
@@ -1276,9 +1301,7 @@ class LiveBugCrossToolGateRegressionTests(unittest.TestCase):
         ), patch.object(
             brain_agent, "generate_text", return_value=_fake_llm_result(payload)
         ), patch.object(
-            tool_executor, "is_agenda_request", return_value=False
-        ), patch.object(
-            message_dispatch, "_calendar_result", return_value=fake_result
+            tool_execution, "execute_calendar_read", return_value=fake_result
         ) as calendar_result, patch.object(
             tool_executor, "handle_cross_tool_fast_request"
         ) as cross_tool_fast_request:

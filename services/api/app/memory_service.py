@@ -10,6 +10,7 @@ from typing import Final
 
 from .database import PROJECT_ROOT, SessionLocal
 from .models import Message
+from .untrusted_content import wrap_tool_summary
 
 logger = logging.getLogger(__name__)
 
@@ -205,13 +206,26 @@ def _rows_to_safe_turns(rows: list[Message]) -> list[MemoryTurn]:
     return turns
 
 
-def _load_safe_turns(scan_messages: int | None = None) -> list[MemoryTurn]:
+def _load_safe_turns(
+    scan_messages: int | None = None,
+    session_id: str | None = None,
+) -> list[MemoryTurn]:
+    """Load recent safe turns, scoped to one session when a session is known.
+
+    Part 10.2 Phase D: passing session_id confines conversational context to the
+    ACTIVE session, so a previous unrelated conversation can never surface as
+    "MOST RECENT TURN / the current active topic". Omitting it preserves the
+    pre-10.2 global scan for callers that have no session identity.
+    """
     scan = scan_messages or _env_int(
         "AO_MEMORY_SCAN_MESSAGES", DEFAULT_SCAN_MESSAGES, minimum=20, maximum=5000
     )
     with SessionLocal() as db:
+        query = db.query(Message)
+        if session_id:
+            query = query.filter(Message.session_id == session_id)
         rows = (
-            db.query(Message)
+            query
             .order_by(Message.id.desc())
             .limit(scan)
             .all()
@@ -239,12 +253,28 @@ def _turn_relevance(query_terms: set[str], turn: MemoryTurn) -> float:
     return (user_overlap * 2.0) + assistant_overlap
 
 
+_TOOL_MEMORY_ROUTES: Final[frozenset[str]] = frozenset(
+    {"gmail", "calendar", "cross_tool"}
+)
+
+
 def _format_turns(turns: list[MemoryTurn], *, limit: int = MAX_MESSAGE_CHARS) -> str:
+    """Render turns for the Brain prompt, preserving each turn's trust class.
+
+    Part 10.2 Phase L: a Bunnelby reply whose route was a tool (gmail, calendar,
+    cross_tool) is prose Bunnelby wrote, but every fact in it came from
+    attacker-controllable external data. Replaying it as plain conversation is
+    exactly the laundering path the audit found, so it is re-wrapped as derived
+    untrusted content before it re-enters the routing context.
+
+    The user's own turn is always trusted: it is what the user actually said.
+    """
     blocks: list[str] = []
     for turn in turns:
-        blocks.append(
-            f"User: {_clip(turn.user, limit)}\nBunnelby: {_clip(turn.assistant, limit)}"
-        )
+        assistant = _clip(turn.assistant, limit)
+        if turn.route in _TOOL_MEMORY_ROUTES:
+            assistant = wrap_tool_summary(turn.route or "tool", assistant).render()
+        blocks.append(f"User: {_clip(turn.user, limit)}\nBunnelby: {assistant}")
     return "\n\n".join(blocks)
 
 
@@ -279,15 +309,21 @@ _TOOL_MEMORY_CUE_PATTERN: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
-_TOOL_MEMORY_ROUTES: Final[frozenset[str]] = frozenset(
-    {"gmail", "calendar", "cross_tool"}
-)
 
 
-def build_memory_context(current_user_message: str) -> str:
-    """Build bounded local context from profile, recent turns, and relevant old turns."""
+def build_memory_context(
+    current_user_message: str,
+    session_id: str | None = None,
+) -> str:
+    """Build bounded local context from profile, recent turns, and relevant old turns.
+
+    When session_id is supplied the whole context is confined to that session.
+    Long-term cross-session recall is intentionally out of scope here; it belongs
+    to Permanent Memory V2 / the Time Machine, which will retrieve explicitly
+    rather than by silently widening the active-topic window.
+    """
     profile = load_user_profile()
-    all_turns = _load_safe_turns()
+    all_turns = _load_safe_turns(session_id=session_id)
 
     configured_recent_count = _env_int(
         "AO_RECENT_MEMORY_TURNS",

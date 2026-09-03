@@ -28,7 +28,11 @@ __all__ = [
 ]
 
 
-def handle_message_result(user_message: str) -> OrchestratorResult:
+def handle_message_result(
+    user_message: str,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+) -> OrchestratorResult:
     """Top-level intelligence facade.
 
     This used to run its own pre-brain keyword gate here (`is_cross_tool_request(...)`)
@@ -42,4 +46,4 @@ def handle_message_result(user_message: str) -> OrchestratorResult:
     combined-read requests are still supported, but only after the brain has classified
     the turn as mode="tool", tool="cross_tool_read" -- see tool_executor.execute().
     """
-    return _legacy_dispatch(user_message)
+    return _legacy_dispatch(user_message, session_id=session_id, turn_id=turn_id)

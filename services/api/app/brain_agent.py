@@ -16,11 +16,12 @@ from .llm_service import (
     generate_text,
 )
 from .memory_service import build_memory_context, local_identity_reply
-from .orchestrator import (
+from .untrusted_content import TRUST_POLICY_CLAUSE
+from .persona import (
     AO_CHAT_SYSTEM_INSTRUCTION,
-    _SIMPLE_GREETING_PATTERN,
-    _general_chat_inference_profile,
-    _time_appropriate_greeting,
+    SIMPLE_GREETING_PATTERN,
+    general_chat_inference_profile,
+    time_appropriate_greeting,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,8 +55,27 @@ _REQUIRED_ARGS_FOR_TOOL: Final[Mapping[str, tuple[str, ...]]] = {
 }
 
 
+ResponsePolicy = Literal["full_ui", "concise_spoken", "both"]
+
+
 @dataclass(frozen=True)
 class BrainDecision:
+    """BrainDecisionV2 (Part 10.2 Phase H).
+
+    The original four fields are unchanged so every existing caller and test
+    keeps working. The additions carry what the typed pipeline needs:
+
+    requires_approval        the model's own read on impact. ADVISORY ONLY --
+                             risk_policy is authoritative and will override a
+                             model that under-declares an external write.
+    reason_code              short machine-readable identifier for diagnostics
+                             and tool_runs, instead of free prose only.
+    untrusted_context_used   provenance ids of external content that informed
+                             this decision (Phase L).
+    response_policy          whether the turn wants screen detail, concise
+                             speech, or both.
+    """
+
     mode: BrainMode
     tool: str | None
     confidence: float
@@ -63,6 +83,14 @@ class BrainDecision:
     reply: str = ""
     spoken_reply: str = ""
     reason: str = ""
+    requires_approval: bool | None = None
+    reason_code: str = ""
+    untrusted_context_used: tuple[str, ...] = ()
+    response_policy: ResponsePolicy = "both"
+
+
+# Explicit alias for callers that want to name the version they depend on.
+BrainDecisionV2 = BrainDecision
 
 
 BRAIN_SYSTEM_INSTRUCTION: Final[str] = (
@@ -176,6 +204,153 @@ will build the final user-facing reply.
 )
 
 
+def _selectable_tool_names() -> frozenset[str]:
+    """Tools the Brain may name, taken from the live registry.
+
+    Falls back to the historical literal set if the registry is somehow empty,
+    so a decision can never be silently discarded because of import ordering.
+    """
+    try:
+        from . import tool_executor  # noqa: F401
+        from .capability_registry import registry
+
+        names = frozenset(registry().tool_names())
+        return names or _ALLOWED_TOOLS
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("Capability registry unavailable; using the static tool set")
+        return _ALLOWED_TOOLS
+
+
+def brain_system_instruction() -> str:
+    """Full routing instruction: persona + prose + trust boundary + live catalog.
+
+    The trust clause is included here (Part 10.2 Phase L) because the live Brain
+    prompt previously had NO untrusted-content language at all -- the only two
+    such clauses in orchestrator.py belonged to the dead legacy router.
+    """
+    return "\n\n".join(
+        (BRAIN_SYSTEM_INSTRUCTION, TRUST_POLICY_CLAUSE, tool_catalog_section())
+    )
+
+
+def _registered_capabilities() -> tuple[dict[str, Any], ...]:
+    """Tool catalog straight from the Capability Registry.
+
+    Imported lazily so brain_agent stays free of an import-time dependency on
+    tool_executor (which imports brain_agent for the decision type). Importing
+    tool_executor here also guarantees capabilities are registered before the
+    catalog is read.
+    """
+    from . import tool_executor  # noqa: F401  (registers capabilities on import)
+    from .capability_registry import registry
+
+    return registry().catalog()
+
+
+def tool_catalog_section() -> str:
+    """Render the registry as prompt text.
+
+    Part 10.2 Phase H: adding a capability now means registering a Capability,
+    not editing an ever-growing prose list. The hand-written disambiguation
+    rules above this section are retained deliberately -- they encode specific
+    regressions (conceptual Gmail questions, collection follow-ups) that a
+    generated summary would lose -- but no NEW tool requires prose edits.
+    """
+    lines = [
+        "REGISTERED CAPABILITY CATALOG (generated from the Capability Registry; "
+        "the only selectable values for \"tool\"):",
+    ]
+    for entry in _registered_capabilities():
+        approval = " [REQUIRES EXPLICIT APPROVAL]" if entry["requires_approval"] else ""
+        lines.append(f"- {entry['name']} ({entry['risk_level']}){approval}: {entry['description']}")
+        if entry.get("selection_guidance"):
+            lines.append(f"    when: {entry['selection_guidance']}")
+        argument_names = sorted(entry["arguments"].get("properties", {}))
+        if argument_names:
+            lines.append(f"    arguments: {', '.join(argument_names)}")
+        required = entry["arguments"].get("required") or []
+        if required:
+            lines.append(f"    required: {', '.join(sorted(required))}")
+    lines.append(
+        "\nArguments must match the named capability's argument list. Omit an argument "
+        "you do not know rather than inventing a value. Unknown argument names are "
+        "discarded, and an invalid value fails the turn closed to a clarification."
+    )
+    return "\n".join(lines)
+
+
+_JSON_SCALARS: Final[Mapping[str, str]] = {
+    "string": "STRING",
+    "integer": "INTEGER",
+    "number": "NUMBER",
+    "boolean": "BOOLEAN",
+}
+
+
+def _argument_property_union() -> dict[str, Any]:
+    """Flat union of every capability's argument fields, for the response schema.
+
+    Provider structured-output schemas do not express "one of these argument
+    objects depending on the tool", so the envelope declares the union of all
+    argument names as optional fields. Pydantic then validates the ones that
+    matter for the selected tool and discards the rest, so the schema constrains
+    shape while tool_requests remains the authority on validity.
+    """
+    properties: dict[str, Any] = {}
+    for entry in _registered_capabilities():
+        for name, spec in entry["arguments"].get("properties", {}).items():
+            declared = spec.get("type")
+            if isinstance(declared, str) and declared in _JSON_SCALARS:
+                kind = _JSON_SCALARS[declared]
+            elif declared == "array":
+                kind = "ARRAY"
+            else:
+                # Unions, enums-with-null and anyOf collapse to STRING: the
+                # model still emits a usable value and Pydantic coerces it.
+                kind = "STRING"
+            existing = properties.get(name)
+            if existing is None:
+                properties[name] = (
+                    {"type": kind, "items": {"type": "STRING"}}
+                    if kind == "ARRAY"
+                    else {"type": kind}
+                )
+            elif existing.get("type") != kind:
+                properties[name] = {"type": "STRING"}
+    return properties
+
+
+def decision_response_schema() -> dict[str, Any]:
+    """Provider-native response schema for BrainDecisionV2."""
+    tools = sorted(entry["name"] for entry in _registered_capabilities())
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "mode": {"type": "STRING", "enum": ["answer", "clarify", "tool"]},
+            # Gemini rejects an empty string as an enum member with HTTP 400, and
+            # nullable enums are unreliable across providers. `tool` is simply
+            # omitted for answer/clarify turns -- it is absent from `required`,
+            # and _parse_decision treats missing/empty as "no tool".
+            "tool": {"type": "STRING", "enum": list(tools)},
+            "confidence": {"type": "NUMBER"},
+            "arguments": {
+                "type": "OBJECT",
+                "properties": _argument_property_union(),
+            },
+            "reply": {"type": "STRING"},
+            "spoken_reply": {"type": "STRING"},
+            "reason": {"type": "STRING"},
+            "reason_code": {"type": "STRING"},
+            "requires_approval": {"type": "BOOLEAN"},
+            "response_policy": {
+                "type": "STRING",
+                "enum": ["full_ui", "concise_spoken", "both"],
+            },
+        },
+        "required": ["mode", "confidence", "reply", "spoken_reply"],
+    }
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -229,9 +404,12 @@ def _parse_decision(raw_text: str, user_message: str) -> BrainDecision:
     if mode not in ("answer", "clarify", "tool"):
         mode = "answer"
 
+    # The structured-output schema uses "" as the no-tool value because nullable
+    # enums are unreliable across providers; both forms map to None here.
     tool = payload.get("tool")
     tool = str(tool).strip() if tool else None
-    if tool not in _ALLOWED_TOOLS:
+    if tool is not None and tool not in _selectable_tool_names():
+        logger.warning("Brain proposed unregistered tool=%r; discarding", tool)
         tool = None
 
     try:
@@ -244,6 +422,14 @@ def _parse_decision(raw_text: str, user_message: str) -> BrainDecision:
     reply = str(payload.get("reply", "")).strip()
     spoken_reply = str(payload.get("spoken_reply", "")).strip()
     reason = str(payload.get("reason", "")).strip()
+    reason_code = str(payload.get("reason_code", "")).strip()[:64]
+    raw_requires_approval = payload.get("requires_approval")
+    requires_approval = (
+        bool(raw_requires_approval) if isinstance(raw_requires_approval, bool) else None
+    )
+    response_policy = str(payload.get("response_policy", "both")).strip().casefold()
+    if response_policy not in ("full_ui", "concise_spoken", "both"):
+        response_policy = "both"
 
     if mode == "tool" and tool is None:
         mode = "clarify"
@@ -270,28 +456,35 @@ def _parse_decision(raw_text: str, user_message: str) -> BrainDecision:
         reply=reply,
         spoken_reply=spoken_reply,
         reason=reason,
+        requires_approval=requires_approval,
+        reason_code=reason_code,
+        response_policy=response_policy,  # type: ignore[arg-type]
     )
 
 
-def decide(user_message: str) -> BrainDecision:
-    """Single semantic decision point: conversational answer, clarification, or tool call."""
+def decide(user_message: str, session_id: str | None = None) -> BrainDecision:
+    """Single semantic decision point: conversational answer, clarification, or tool call.
+
+    session_id (Part 10.2 Phase D) confines the memory context to the active
+    conversation. It is optional so existing callers keep working.
+    """
     text = user_message.strip()
 
     if not text:
-        greeting = _time_appropriate_greeting()
+        greeting = time_appropriate_greeting()
         return BrainDecision(mode="answer", tool=None, confidence=1.0, reply=greeting, spoken_reply=greeting, reason="empty message")
 
-    if _SIMPLE_GREETING_PATTERN.match(text):
-        greeting = _time_appropriate_greeting()
+    if SIMPLE_GREETING_PATTERN.match(text):
+        greeting = time_appropriate_greeting()
         return BrainDecision(mode="answer", tool=None, confidence=1.0, reply=greeting, spoken_reply=greeting, reason="simple greeting fast path")
 
     identity_reply = local_identity_reply(text)
     if identity_reply:
         return BrainDecision(mode="answer", tool=None, confidence=1.0, reply=identity_reply, spoken_reply=identity_reply, reason="local identity fast path")
 
-    memory_context = build_memory_context(text)
+    memory_context = build_memory_context(text, session_id=session_id)
     local_now = datetime.now().astimezone()
-    inference_profile = _general_chat_inference_profile(text)
+    inference_profile = general_chat_inference_profile(text)
     spoken_language = detect_spoken_language(text)
     spoken_output_directive = (
         "Hindi in natural Devanagari. Do not write Roman Hindi in spoken_reply; "
@@ -316,8 +509,15 @@ def decide(user_message: str) -> BrainDecision:
     )
 
     try:
+        # ONE generation per turn. The same call decides the route AND produces
+        # the conversational reply, so ordinary chat never pays a routing call
+        # plus a second answer call.
         generator = generate_fast_text if inference_profile == "fast" else generate_text
-        result = generator(system_instruction=BRAIN_SYSTEM_INSTRUCTION, user_content=user_content)
+        result = generator(
+            system_instruction=brain_system_instruction(),
+            user_content=user_content,
+            response_schema=decision_response_schema(),
+        )
         decision = _parse_decision(result.text, text)
         logger.info(
             "brain_agent decision mode=%s tool=%s confidence=%.2f provider=%s reason=%s",

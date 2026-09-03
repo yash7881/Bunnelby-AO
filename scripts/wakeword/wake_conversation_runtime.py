@@ -35,6 +35,7 @@ from services.api.app.audio_playback import (
     PlaybackStatus,
     SoundDeviceWavPlayer,
 )
+from services.api.app.session_service import new_session_id
 from services.api.app.stt_service import (
     STTServiceError,
     TranscriptionResult,
@@ -366,8 +367,23 @@ def capture_conversation_turn(
             return None
 
 
-def dispatch_to_chat(api_url: str, transcript: str, timeout: float) -> dict[str, object]:
-    payload = json.dumps({"message": transcript}).encode("utf-8")
+def dispatch_to_chat(
+    api_url: str,
+    transcript: str,
+    timeout: float,
+    session_id: str | None = None,
+) -> dict[str, object]:
+    """POST one transcript to /chat.
+
+    Part 10.2 Phase D: session_id ties every turn of one wake -> follow-up
+    conversation together, so a later conversation never inherits this one as
+    its active topic. Omitting it keeps the pre-10.2 behavior (the backend mints
+    a fresh isolated session).
+    """
+    body_payload: dict[str, object] = {"message": transcript}
+    if session_id:
+        body_payload["session_id"] = session_id
+    payload = json.dumps(body_payload).encode("utf-8")
     request = urllib.request.Request(
         api_url,
         data=payload,
@@ -1027,6 +1043,7 @@ def run(args: argparse.Namespace) -> int:
             samplerate=SAMPLE_RATE,
             blocksize=READ_SAMPLES,
         ) as microphone:
+            conversation_session_id: str | None = None
             while args.turns == 0 or stats.conversation_turns < args.turns:
                 if controller.state is VoiceState.STANDBY:
                     try:
@@ -1050,6 +1067,11 @@ def run(args: argparse.Namespace) -> int:
                     )
                     _state(controller, controller.wake_detected())
                     _state(controller, controller.begin_listening())
+                    # A fresh wake starts a new conversation. Follow-up turns
+                    # below reuse this id; returning to STANDBY and waking again
+                    # mints another one.
+                    conversation_session_id = new_session_id()
+                    print(f"Conversation session: {conversation_session_id}")
                     pending_wake_latency_ms = wake_latency * 1000.0
                     next_audio = capture_conversation_turn(
                         microphone,
@@ -1165,6 +1187,7 @@ def run(args: argparse.Namespace) -> int:
                         args.api_url,
                         transcript,
                         args.chat_timeout,
+                        session_id=conversation_session_id,
                     )
                     dispatch_seconds = time.perf_counter() - dispatch_started
                     metrics.backend_ms = dispatch_seconds * 1000.0

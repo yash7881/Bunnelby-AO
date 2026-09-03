@@ -18,6 +18,8 @@ from .approval_service import (
 from .database import SessionLocal
 from .intelligence_dispatch import handle_message_result
 from .models import Message
+from . import verification_service
+from .session_service import resolve_turn_context
 from .schemas import (
     ApprovalDecisionResponse,
     ApprovalResponse,
@@ -95,10 +97,22 @@ def _approval_response(value) -> ApprovalResponse | None:
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
-    user_message = Message(role="user", content=payload.message)
+    # Part 10.2 Phase D: every turn carries explicit identity. A caller that
+    # omits session_id gets a fresh isolated session rather than inheriting the
+    # previous conversation's active topic.
+    turn = resolve_turn_context(payload.session_id)
+
+    user_message = Message(
+        role="user",
+        content=payload.message,
+        session_id=turn.session_id,
+        turn_id=turn.turn_id,
+    )
     db.add(user_message)
 
-    result = handle_message_result(payload.message)
+    result = handle_message_result(
+        payload.message, session_id=turn.session_id, turn_id=turn.turn_id
+    )
     spoken = select_spoken_response(
         payload.message,
         result.action_type,
@@ -106,7 +120,12 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
         metadata=result.spoken_metadata,
     )
 
-    assistant_message = Message(role="assistant", content=result.memory_content)
+    assistant_message = Message(
+        role="assistant",
+        content=result.memory_content,
+        session_id=turn.session_id,
+        turn_id=turn.turn_id,
+    )
     db.add(assistant_message)
     db.commit()
 
@@ -115,6 +134,8 @@ def chat(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
 
     return ChatResponse(
         reply=result.reply,
+        session_id=turn.session_id,
+        turn_id=turn.turn_id,
         spoken_reply=spoken.text,
         spoken_ack=spoken.text,
         spoken_language=spoken.language,
@@ -180,6 +201,14 @@ def approve(approval_id: int) -> ApprovalDecisionResponse:
     except ApprovalConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    # Part 10.2 Phase K: read the external state back and record evidence.
+    # Deliberately placed here rather than inside approval_service so that the
+    # snapshot / idempotency / CAS core stays byte-for-byte untouched. Both the
+    # desktop app and the voice runtime approve through this endpoint.
+    verification = verification_service.verify_approved_execution(
+        result.approval, result.outcome
+    )
+
     language = approval_spoken_language(result.approval)
     task_type = result.approval.task_type
     spoken_reply = None
@@ -205,10 +234,16 @@ def approve(approval_id: int) -> ApprovalDecisionResponse:
             else "The confirmation is uncertain. I won't retry automatically."
         )
 
+    # An unverified external action must never be reported as a clean success.
+    uncertainty = verification_service.uncertainty_message(verification)
+    message = f"{result.message} {uncertainty}".strip() if uncertainty else result.message
+    if uncertainty:
+        spoken_reply = uncertainty
+
     return ApprovalDecisionResponse(
         approval=ApprovalResponse(**approval_public_dict(result.approval)),
         outcome=result.outcome,
-        message=result.message,
+        message=message,
         spoken_reply=spoken_reply,
         spoken_language=language,
     )
