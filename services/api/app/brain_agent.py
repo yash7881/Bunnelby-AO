@@ -16,6 +16,7 @@ from .llm_service import (
     generate_text,
 )
 from .memory_service import build_memory_context, local_identity_reply
+from .personal_facts import build_personal_facts_context, fact_saved_reply, try_save_stated_fact
 from .untrusted_content import TRUST_POLICY_CLAUSE
 from .persona import (
     AO_CHAT_SYSTEM_INSTRUCTION,
@@ -487,7 +488,15 @@ def decide(user_message: str, session_id: str | None = None) -> BrainDecision:
     if identity_reply:
         return BrainDecision(mode="answer", tool=None, confidence=1.0, reply=identity_reply, spoken_reply=identity_reply, reason="local identity fast path")
 
+    saved_fact = try_save_stated_fact(text, session_id=session_id)
+    if saved_fact:
+        ack = fact_saved_reply(saved_fact)
+        return BrainDecision(mode="answer", tool=None, confidence=1.0, reply=ack, spoken_reply=ack, reason="personal fact saved")
+
     memory_context = build_memory_context(text, session_id=session_id)
+    facts_context = build_personal_facts_context()
+    if facts_context:
+        memory_context = f"{memory_context}\n\n{facts_context}"
     local_now = datetime.now().astimezone()
     inference_profile = general_chat_inference_profile(text)
     spoken_language = detect_spoken_language(text)

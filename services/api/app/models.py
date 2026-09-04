@@ -111,6 +111,30 @@ class VerificationEvidence(Base):
     )
 
 
+class UserFact(Base):
+    """Explicit, user-stated personal fact (Personal Facts Memory V1).
+
+    Populated only by deterministic pattern-matched extraction in
+    personal_facts.py -- never inferred by the LLM. One row per relation key;
+    a later restated fact replaces the earlier value rather than
+    accumulating duplicates, matching this app's single-user local model.
+    """
+
+    __tablename__ = "user_facts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    relation: Mapped[str] = mapped_column(Text, nullable=False, unique=True, index=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    source_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_turn_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
 class Approval(Base):
     """Durable human decision plus immutable execution snapshot for controlled actions."""
 
