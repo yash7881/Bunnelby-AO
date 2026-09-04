@@ -6,8 +6,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Callable, Final, Literal, Mapping, Protocol
 
 from google import genai
@@ -25,10 +27,13 @@ from .provider_config import (
     gemini_fast_model_name,
     gemini_model_name,
     groq_model_name,
+    max_transient_retries,
     model_stability,
     provider_configured,
     provider_key,
     request_timeout_seconds,
+    transient_cooldown_seconds,
+    transient_retry_delay_ms,
     validate_fixed_groq_endpoint,
 )
 from .provider_health import ProviderHealth, check_provider_model, redact_secrets
@@ -44,16 +49,23 @@ logger = logging.getLogger(__name__)
 # places, cross_tool_fastpath had its own Groq-first policy, only Gemini had a
 # breaker, and a brand-new Gemini client was constructed per request.
 #
-# NOT in scope: loading a real local model. LocalReasoningProvider below is an
-# interface plus state so Part 27 can attach Ollama without the Brain or the
-# executor changing shape.
+# Part 10.2.1 adds bounded transient retries plus same-process diagnostics. It
+# intentionally does NOT add a real local model; Part 27 attaches one through
+# LocalReasoningProvider without changing the Brain/executor contract.
 
 InferenceProfileName = Literal["balanced", "fast", "low_latency_synthesis", "groq_only"]
 GatewayMode = Literal["cloud", "degraded_local", "unavailable"]
 
 DEFAULT_BREAKER_THRESHOLD: Final[int] = 1
 DEFAULT_GROQ_COOLDOWN_SECONDS: Final[int] = 120
+DEFAULT_RATE_LIMIT_FALLBACK_SECONDS: Final[int] = 120
+MAX_RETRY_AFTER_SECONDS: Final[int] = 900
 MAX_TRACKED_LATENCIES: Final[int] = 20
+MAX_PROVIDER_EVENTS: Final[int] = 50
+TRANSIENT_RETRY_CODES: Final[frozenset[str]] = frozenset(
+    {"transport", "http_500", "http_502", "http_503", "http_504"}
+)
+GATEWAY_STARTED_AT: Final[datetime] = datetime.now(timezone.utc)
 
 
 def _now() -> datetime:
@@ -90,8 +102,20 @@ class ProviderState:
         return max(0, int(self.cooldown_until_monotonic - time.monotonic()))
 
     def is_open(self) -> bool:
-        """True when the breaker is open, i.e. this pair must be skipped."""
+        """True while this pair must be skipped."""
         return time.monotonic() < self.cooldown_until_monotonic
+
+    def circuit_state(self) -> str:
+        """Return closed/open/half_open without a background probe thread.
+
+        After cooldown expiry, the next real request is the half-open probe.
+        Success closes the circuit; failure opens it again.
+        """
+        if self.is_open():
+            return "open"
+        if self.consecutive_failures > 0 and self.cooldown_until_monotonic > 0:
+            return "half_open"
+        return "closed"
 
     def average_latency_ms(self) -> float | None:
         if not self.recent_latencies_ms:
@@ -104,6 +128,7 @@ class ProviderState:
             "model": self.model,
             "stability": self.stability,
             "healthy": not self.is_open(),
+            "circuit_state": self.circuit_state(),
             "consecutive_failures": self.consecutive_failures,
             "total_failures": self.total_failures,
             "total_successes": self.total_successes,
@@ -117,11 +142,12 @@ class ProviderState:
 
 
 class ProviderRegistry:
-    """Thread-safe circuit-breaker store keyed by (provider, model)."""
+    """Thread-safe circuit/event store keyed by (provider, model)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._states: dict[tuple[str, str], ProviderState] = {}
+        self._events: deque[dict[str, object]] = deque(maxlen=MAX_PROVIDER_EVENTS)
 
     def state(self, provider: str, model: str) -> ProviderState:
         key = (provider, model)
@@ -145,6 +171,15 @@ class ProviderRegistry:
             state.last_success_at = _now()
             state.recent_latencies_ms.append(latency_ms)
             del state.recent_latencies_ms[:-MAX_TRACKED_LATENCIES]
+            self._events.append(
+                {
+                    "event": "success",
+                    "provider": provider,
+                    "model": model,
+                    "at": state.last_success_at.isoformat(),
+                    "latency_ms": round(float(latency_ms), 2),
+                }
+            )
 
     def record_failure(
         self,
@@ -168,6 +203,18 @@ class ProviderRegistry:
                 state.cooldown_until_monotonic = max(
                     state.cooldown_until_monotonic, time.monotonic() + cooldown_seconds
                 )
+            self._events.append(
+                {
+                    "event": "failure",
+                    "provider": provider,
+                    "model": model,
+                    "at": state.last_failure_at.isoformat(),
+                    "error_code": error_code,
+                    "detail": safe_detail,
+                    "cooldown_seconds": int(cooldown_seconds),
+                    "circuit_state": state.circuit_state(),
+                }
+            )
         logger.warning(
             "Model gateway breaker: %s/%s failure=%s cooldown=%ss detail=%s",
             provider,
@@ -176,6 +223,31 @@ class ProviderRegistry:
             cooldown_seconds,
             safe_detail,
         )
+
+    def record_retry(
+        self,
+        provider: str,
+        model: str,
+        *,
+        error_code: str,
+        detail: str,
+        retry_number: int,
+        delay_ms: int,
+    ) -> None:
+        safe_detail = redact_secrets(detail)
+        with self._lock:
+            self._events.append(
+                {
+                    "event": "retry",
+                    "provider": provider,
+                    "model": model,
+                    "at": _now().isoformat(),
+                    "error_code": error_code,
+                    "detail": safe_detail,
+                    "retry_number": int(retry_number),
+                    "delay_ms": int(delay_ms),
+                }
+            )
 
     def clear(self, provider: str | None = None, model: str | None = None) -> None:
         with self._lock:
@@ -192,11 +264,18 @@ class ProviderRegistry:
     def reset(self) -> None:
         with self._lock:
             self._states.clear()
+            self._events.clear()
 
     def snapshots(self) -> tuple[dict[str, object], ...]:
         with self._lock:
             states = list(self._states.values())
         return tuple(state.snapshot() for state in states)
+
+    def recent_events(self, limit: int = 20) -> tuple[dict[str, object], ...]:
+        safe_limit = max(1, min(int(limit), MAX_PROVIDER_EVENTS))
+        with self._lock:
+            events = list(self._events)[-safe_limit:]
+        return tuple(dict(event) for event in events)
 
 
 REGISTRY: Final[ProviderRegistry] = ProviderRegistry()
@@ -263,12 +342,7 @@ _gemini_clients: dict[str, genai.Client] = {}
 
 
 def gemini_client() -> genai.Client:
-    """Return a cached Gemini client for the configured key.
-
-    Previously every request built and closed a fresh client, paying a new TLS
-    handshake on each conversational turn. The client is keyed by API key so a
-    rotated key produces a new client rather than reusing a stale one.
-    """
+    """Return a cached Gemini client for the configured key."""
     api_key = provider_key("gemini")
     if not api_key:
         raise LLMConfigurationError("GEMINI_API_KEY is not configured.")
@@ -295,6 +369,125 @@ def reset_clients() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Resilience helpers
+# --------------------------------------------------------------------------- #
+
+
+def _retry_after_seconds_from_headers(headers: object) -> int | None:
+    """Parse Retry-After seconds or HTTP-date without trusting response bodies."""
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+
+    raw = getter("Retry-After") or getter("retry-after")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    try:
+        seconds = int(float(text))
+    except ValueError:
+        try:
+            target = parsedate_to_datetime(text)
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            seconds = int((target - _now()).total_seconds() + 0.999)
+        except Exception:
+            return None
+
+    if seconds <= 0:
+        return 1
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
+
+
+def _exception_retry_after_seconds(exc: BaseException) -> int | None:
+    """Best-effort Retry-After extraction across provider SDK exception shapes."""
+    for candidate in (getattr(exc, "response", None), exc):
+        headers = getattr(candidate, "headers", None)
+        parsed = _retry_after_seconds_from_headers(headers)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _cooldown_for_failure(
+    provider: str,
+    error_code: str,
+    *,
+    retry_after_seconds: int | None,
+) -> int:
+    """Choose a bounded breaker cooldown by failure class."""
+    if error_code == "http_429":
+        if retry_after_seconds is not None:
+            return min(max(1, retry_after_seconds), MAX_RETRY_AFTER_SECONDS)
+        configured = (
+            gemini_cooldown_seconds()
+            if provider == "gemini"
+            else groq_cooldown_seconds()
+        )
+        return min(configured, DEFAULT_RATE_LIMIT_FALLBACK_SECONDS)
+
+    if error_code in TRANSIENT_RETRY_CODES:
+        return transient_cooldown_seconds()
+
+    return 0
+
+
+def _call_with_transient_retry(
+    provider: str,
+    model: str,
+    invoke: Callable[[], object],
+) -> object:
+    """Retry only transport/5xx errors, never auth/config/429 failures.
+
+    A retry is deliberately tiny and bounded. If it still fails, the caller
+    raises to `generate`, which records the breaker and immediately tries the
+    next provider.
+    """
+    retries = max_transient_retries()
+    base_delay_ms = transient_retry_delay_ms()
+
+    for retry_index in range(retries + 1):
+        try:
+            return invoke()
+        except _ProviderCallError as exc:
+            can_retry = (
+                exc.recoverable
+                and exc.error_code in TRANSIENT_RETRY_CODES
+                and retry_index < retries
+            )
+            if not can_retry:
+                raise
+
+            delay_ms = min(2000, base_delay_ms * (2 ** retry_index))
+            REGISTRY.record_retry(
+                provider,
+                model,
+                error_code=exc.error_code,
+                detail=str(exc),
+                retry_number=retry_index + 1,
+                delay_ms=delay_ms,
+            )
+            logger.warning(
+                "Model gateway transient retry: provider=%s model=%s "
+                "error=%s retry=%s/%s delay=%sms",
+                provider,
+                model,
+                exc.error_code,
+                retry_index + 1,
+                retries,
+                delay_ms,
+            )
+            time.sleep(delay_ms / 1000.0)
+
+    raise AssertionError("unreachable")
+
+
+# --------------------------------------------------------------------------- #
 # Provider call primitives
 # --------------------------------------------------------------------------- #
 
@@ -309,9 +502,6 @@ def _gemini_call(
     response_schema: Mapping[str, object] | None = None,
 ) -> LLMResult:
     client = gemini_client()
-    # Part 10.2 Phase H: when a caller supplies a schema, use provider-native
-    # structured output instead of asking for JSON in prose. The model then
-    # cannot emit a mode/tool value outside the enum.
     structured = (
         {"response_mime_type": "application/json", "response_schema": dict(response_schema)}
         if response_schema
@@ -331,31 +521,45 @@ def _gemini_call(
             **structured,
         }
 
-    try:
-        response = client.models.generate_content(
-            model=model, contents=user_content, config=config
-        )
-    except errors.APIError as exc:
-        code = int(getattr(exc, "code", 0) or 0)
-        recoverable = code in RECOVERABLE_GEMINI_CODES
-        raise _ProviderCallError(
-            error_code=f"http_{code or 'unknown'}",
-            message=f"Gemini request failed (HTTP {code or 'unknown'}).",
-            recoverable=recoverable,
-            cooldown_seconds=gemini_cooldown_seconds() if recoverable else 0,
-        ) from exc
-    except LLMServiceError:
-        raise
-    except Exception as exc:
-        # Transport failures are safe to fail over and worth a cooldown so
-        # repeated turns do not stall on the same failing primary.
-        raise _ProviderCallError(
-            error_code="transport",
-            message="Gemini request failed before a usable response arrived.",
-            recoverable=True,
-            cooldown_seconds=gemini_cooldown_seconds(),
-        ) from exc
+    def invoke_once() -> object:
+        try:
+            return client.models.generate_content(
+                model=model, contents=user_content, config=config
+            )
+        except errors.APIError as exc:
+            code = int(getattr(exc, "code", 0) or 0)
+            error_code = f"http_{code or 'unknown'}"
+            recoverable = code in RECOVERABLE_GEMINI_CODES
+            retry_after = _exception_retry_after_seconds(exc)
+            raise _ProviderCallError(
+                error_code=error_code,
+                message=f"Gemini request failed (HTTP {code or 'unknown'}).",
+                recoverable=recoverable,
+                cooldown_seconds=(
+                    _cooldown_for_failure(
+                        "gemini",
+                        error_code,
+                        retry_after_seconds=retry_after,
+                    )
+                    if recoverable
+                    else 0
+                ),
+            ) from exc
+        except LLMServiceError:
+            raise
+        except Exception as exc:
+            raise _ProviderCallError(
+                error_code="transport",
+                message="Gemini request failed before a usable response arrived.",
+                recoverable=True,
+                cooldown_seconds=_cooldown_for_failure(
+                    "gemini",
+                    "transport",
+                    retry_after_seconds=None,
+                ),
+            ) from exc
 
+    response = _call_with_transient_retry("gemini", model, invoke_once)
     text = (getattr(response, "text", None) or "").strip()
     if not text:
         raise _ProviderCallError(
@@ -402,9 +606,8 @@ def _groq_call(
         "temperature": temperature,
     }
     if response_schema:
-        # Groq exposes JSON mode rather than a full schema; the envelope is
-        # still validated by _parse_decision and tool_requests afterwards.
         payload["response_format"] = {"type": "json_object"}
+
     request = urllib.request.Request(
         GROQ_CHAT_COMPLETIONS_URL,
         data=json.dumps(payload).encode("utf-8"),
@@ -417,31 +620,55 @@ def _groq_call(
         method="POST",
     )
 
-    try:
-        # B310 is suppressed only after the strict scheme/host/path validation
-        # above; the URL is a compile-time constant.
-        with urllib.request.urlopen(  # nosec B310
-            request, timeout=request_timeout_seconds()
-        ) as response:
-            body = response.read()
-    except urllib.error.HTTPError as exc:
-        detail = _groq_error_message(exc.read())
-        suffix = f": {detail}" if detail else ""
+    def invoke_once() -> object:
+        try:
+            with urllib.request.urlopen(  # nosec B310
+                request, timeout=request_timeout_seconds()
+            ) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            retry_after = _retry_after_seconds_from_headers(
+                getattr(exc, "headers", None)
+            )
+            detail = _groq_error_message(exc.read())
+            suffix = f": {detail}" if detail else ""
+            error_code = f"http_{exc.code}"
+            recoverable = exc.code in RECOVERABLE_GEMINI_CODES
+            raise _ProviderCallError(
+                error_code=error_code,
+                message=f"Groq request failed (HTTP {exc.code}){suffix}",
+                recoverable=recoverable,
+                cooldown_seconds=(
+                    _cooldown_for_failure(
+                        "groq",
+                        error_code,
+                        retry_after_seconds=retry_after,
+                    )
+                    if recoverable
+                    else 0
+                ),
+            ) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise _ProviderCallError(
+                error_code="transport",
+                message="Groq is temporarily unreachable.",
+                recoverable=True,
+                cooldown_seconds=_cooldown_for_failure(
+                    "groq",
+                    "transport",
+                    retry_after_seconds=None,
+                ),
+            ) from exc
+
+    raw_body = _call_with_transient_retry("groq", model, invoke_once)
+    if not isinstance(raw_body, (bytes, bytearray)):
         raise _ProviderCallError(
-            error_code=f"http_{exc.code}",
-            message=f"Groq request failed (HTTP {exc.code}){suffix}",
-            recoverable=exc.code in RECOVERABLE_GEMINI_CODES,
-            cooldown_seconds=(
-                groq_cooldown_seconds() if exc.code in RECOVERABLE_GEMINI_CODES else 0
-            ),
-        ) from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise _ProviderCallError(
-            error_code="transport",
-            message="Groq is temporarily unreachable.",
+            error_code="invalid_payload",
+            message="Groq returned an invalid response payload.",
             recoverable=True,
-            cooldown_seconds=groq_cooldown_seconds(),
-        ) from exc
+            cooldown_seconds=0,
+        )
+    body = bytes(raw_body)
 
     try:
         data = json.loads(body.decode("utf-8"))
@@ -568,14 +795,14 @@ def profile_names() -> tuple[str, ...]:
 
 
 # --------------------------------------------------------------------------- #
-# Gateway mode
+# Gateway mode + diagnostics
 # --------------------------------------------------------------------------- #
 
 
 def gateway_mode() -> GatewayMode:
     """Report whether cloud reasoning is usable, or why it is not.
 
-    'cloud'          at least one configured cloud pair has a closed breaker
+    'cloud'          at least one configured cloud pair has a non-open breaker
     'degraded_local' no usable cloud pair, but a local provider is available
     'unavailable'    nothing can serve a reasoning request right now
     """
@@ -590,10 +817,19 @@ def gateway_mode() -> GatewayMode:
 
 
 def provider_status() -> dict[str, object]:
-    """Structured gateway state for diagnostics and the future Reality Layer."""
+    """Structured live gateway state from this exact backend process."""
     return {
         "mode": gateway_mode(),
         "checked_at": _now(),
+        "diagnostic_scope": "current_backend_process",
+        "process_started_at": GATEWAY_STARTED_AT,
+        "resilience_policy": {
+            "max_transient_retries": max_transient_retries(),
+            "transient_retry_delay_ms": transient_retry_delay_ms(),
+            "transient_cooldown_seconds": transient_cooldown_seconds(),
+            "rate_limit_fallback_seconds": DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
+            "max_retry_after_seconds": MAX_RETRY_AFTER_SECONDS,
+        },
         "local_provider": {
             "name": local_provider().name,
             "available": local_provider().available(),
@@ -608,20 +844,21 @@ def provider_status() -> dict[str, object]:
                     "breaker_open": REGISTRY.state(
                         candidate.provider, candidate.model()
                     ).is_open(),
+                    "circuit_state": REGISTRY.state(
+                        candidate.provider, candidate.model()
+                    ).circuit_state(),
                 }
                 for candidate in spec.candidates
             ]
             for name, spec in _profiles().items()
         },
         "circuits": REGISTRY.snapshots(),
+        "recent_events": REGISTRY.recent_events(),
     }
 
 
 def preflight(*, listers: Mapping[str, object] | None = None) -> tuple[ProviderHealth, ...]:
-    """Read-only availability preflight for every profile candidate.
-
-    Reuses provider_health rather than duplicating model-list logic.
-    """
+    """Read-only availability preflight for every profile candidate."""
     seen: set[tuple[str, str]] = set()
     records: list[ProviderHealth] = []
     for spec in _profiles().values():
@@ -634,7 +871,9 @@ def preflight(*, listers: Mapping[str, object] | None = None) -> tuple[ProviderH
             if listers is not None:
                 lister = listers.get(candidate.provider)  # type: ignore[assignment]
             records.append(
-                check_provider_model(candidate.provider, candidate.model(), lister=lister)  # type: ignore[arg-type]
+                check_provider_model(
+                    candidate.provider, candidate.model(), lister=lister  # type: ignore[arg-type]
+                )
             )
     return tuple(records)
 
@@ -691,8 +930,9 @@ def generate(
 ) -> LLMResult:
     """Run one generation through the profile's provider chain.
 
-    Exactly one successful provider call is made per invocation; the gateway
-    never issues a second call for the same request beyond failing over.
+    The gateway makes at most one *successful* provider call. A provider
+    primitive may perform a small bounded retry for transport/5xx errors before
+    failing over. 429/auth/config failures are never same-provider retry loops.
     """
     spec = profile(profile_name)
     failures: list[str] = []
@@ -808,6 +1048,7 @@ __all__ = [
     "GatewayMode",
     "InferenceProfile",
     "LocalReasoningProvider",
+    "MAX_RETRY_AFTER_SECONDS",
     "ProviderCandidate",
     "ProviderRegistry",
     "ProviderState",

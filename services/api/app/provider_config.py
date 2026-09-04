@@ -35,8 +35,14 @@ DEFAULT_GEMINI_FAST_MODEL: Final[str] = "gemini-3.5-flash-lite"
 # (llama-3.3-70b-versatile) was retired and is absent from the live model list.
 DEFAULT_GROQ_MODEL: Final[str] = "openai/gpt-oss-120b"
 
-DEFAULT_GEMINI_COOLDOWN_SECONDS: Final[int] = 900
+# 10.2.1 Provider Resilience:
+# - 429s fall back quickly instead of pinning Gemini open for 15 minutes.
+# - transport/5xx failures get one small bounded retry, then a short breaker.
+DEFAULT_GEMINI_COOLDOWN_SECONDS: Final[int] = 120
 DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[int] = 45
+DEFAULT_TRANSIENT_COOLDOWN_SECONDS: Final[int] = 30
+DEFAULT_TRANSIENT_RETRY_DELAY_MS: Final[int] = 250
+DEFAULT_MAX_TRANSIENT_RETRIES: Final[int] = 1
 
 GROQ_CHAT_COMPLETIONS_URL: Final[str] = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL: Final[str] = "https://api.groq.com/openai/v1/models"
@@ -106,6 +112,32 @@ def gemini_cooldown_seconds() -> int:
 
 def request_timeout_seconds() -> int:
     return env_int("LLM_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS)
+
+
+def transient_cooldown_seconds() -> int:
+    return env_int("LLM_TRANSIENT_COOLDOWN_SECONDS", DEFAULT_TRANSIENT_COOLDOWN_SECONDS)
+
+
+def transient_retry_delay_ms() -> int:
+    return min(
+        2000,
+        env_int(
+            "LLM_TRANSIENT_RETRY_DELAY_MS",
+            DEFAULT_TRANSIENT_RETRY_DELAY_MS,
+            minimum=1,
+        ),
+    )
+
+
+def max_transient_retries() -> int:
+    return min(
+        2,
+        env_int(
+            "LLM_MAX_TRANSIENT_RETRIES",
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            minimum=0,
+        ),
+    )
 
 
 def provider_key(provider: str) -> str:

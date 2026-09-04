@@ -1,4 +1,5 @@
 import logging
+from dataclasses import asdict
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +19,7 @@ from .approval_service import (
 from .database import SessionLocal
 from .intelligence_dispatch import handle_message_result
 from .models import Message
+from . import model_gateway
 from . import verification_service
 from .session_service import resolve_turn_context
 from .schemas import (
@@ -80,6 +82,25 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+@app.get("/health/providers")
+def provider_health_status(
+    probe: bool = Query(
+        default=False,
+        description="Run read-only provider model-list preflight; never generates content.",
+    ),
+) -> dict[str, object]:
+    """Return provider state from this exact running FastAPI process.
+
+    `probe=false` is zero-completion/in-memory. `probe=true` additionally lists
+    provider models using the existing read-only preflight; it never asks an LLM
+    to generate content.
+    """
+    status = model_gateway.provider_status()
+    if probe:
+        status["preflight"] = [asdict(record) for record in model_gateway.preflight()]
+    return status
 
 
 def _approval_response(value) -> ApprovalResponse | None:
