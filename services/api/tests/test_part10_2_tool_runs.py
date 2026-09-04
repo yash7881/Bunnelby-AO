@@ -331,10 +331,10 @@ class LiveDatabaseStateTests(unittest.TestCase):
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
             tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
-            for required in ("tool_runs", "verification_evidence", "task_log", "messages", "approvals"):
+            for required in ("tool_runs", "verification_evidence", "task_log", "messages", "approvals", "user_facts"):
                 self.assertIn(required, tables, f"{required} must exist")
             self.assertEqual(
-                con.execute("select version_num from alembic_version").fetchone()[0], "0006"
+                con.execute("select version_num from alembic_version").fetchone()[0], "0007"
             )
 
             # task_log is retained as frozen history: nothing writes to it any

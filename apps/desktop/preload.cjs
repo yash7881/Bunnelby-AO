@@ -1,6 +1,11 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('bunnelbyVoice', {
+  setRendererSpeaking(isSpeaking) {
+    if (typeof isSpeaking !== 'boolean') return;
+    ipcRenderer.send('bunnelby:renderer-speaking', isSpeaking);
+  },
+
   onEvent(callback) {
     if (typeof callback !== 'function') return () => {};
 

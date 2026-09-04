@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -95,6 +96,8 @@ DEFAULT_BARGE_IN_MIN_SPEECH_SECONDS = 0.18
 DEFAULT_BARGE_IN_ECHO_MARGIN = 2.0
 DEFAULT_BARGE_IN_MIN_RMS = 0.008
 READ_SAMPLES = 512
+DEFAULT_RENDERER_SPEAKER_TAIL_SECONDS = 0.75
+RENDERER_SPEAKING_CONTROL_TYPE = "renderer_speaking"
 
 # Barge-in onset detection. Bunnelby knows exactly what it is playing, so the expected
 # level of its own speaker leakage is predicted from the live playback reference and the
@@ -138,6 +141,93 @@ def _emit_ui_event(event: str, **payload: object) -> None:
         + json.dumps(message, ensure_ascii=False, separators=(",", ":")),
         flush=True,
     )
+
+
+class ExternalPlaybackGate:
+    """Thread-safe suppression for renderer-owned speaker playback.
+
+    Electron sends strict newline-delimited control messages on this process'
+    stdin. While renderer TTS is active, standby microphone frames are consumed
+    but never wake-matched. Releasing the gate keeps a short tail window so
+    speaker/room echo already in flight also cannot become a wake candidate.
+    """
+
+    def __init__(
+        self,
+        tail_seconds: float = DEFAULT_RENDERER_SPEAKER_TAIL_SECONDS,
+        *,
+        clock=time.monotonic,
+    ) -> None:
+        self.tail_seconds = max(0.0, float(tail_seconds))
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._speaking = False
+        self._blocked_until = 0.0
+
+    def set_renderer_speaking(self, speaking: bool) -> None:
+        now = self._clock()
+        with self._lock:
+            self._speaking = bool(speaking)
+            self._blocked_until = (
+                float("inf") if self._speaking else now + self.tail_seconds
+            )
+
+    def is_blocked(self) -> bool:
+        now = self._clock()
+        with self._lock:
+            return self._speaking or now < self._blocked_until
+
+    def remaining_seconds(self) -> float:
+        now = self._clock()
+        with self._lock:
+            if self._speaking:
+                return float("inf")
+            return max(0.0, self._blocked_until - now)
+
+
+def _handle_voice_control_line(line: str, gate: ExternalPlaybackGate) -> bool:
+    try:
+        payload = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("type") != RENDERER_SPEAKING_CONTROL_TYPE:
+        return False
+
+    speaking = payload.get("speaking")
+    if not isinstance(speaking, bool):
+        return False
+
+    gate.set_renderer_speaking(speaking)
+    return True
+
+
+def _voice_control_loop(stream, gate: ExternalPlaybackGate) -> None:
+    try:
+        for line in stream:
+            if not _handle_voice_control_line(line, gate):
+                continue
+            remaining = gate.remaining_seconds()
+            state = "speaking" if remaining == float("inf") else f"tail={remaining:.2f}s"
+            print(
+                f"Renderer TTS wake suppression updated ({state}).",
+                flush=True,
+            )
+    finally:
+        gate.set_renderer_speaking(False)
+
+
+def _start_voice_control_listener(stream, gate: ExternalPlaybackGate) -> threading.Thread:
+    thread = threading.Thread(
+        target=_voice_control_loop,
+        args=(stream, gate),
+        daemon=True,
+        name="bunnelby-renderer-voice-control",
+    )
+    thread.start()
+    return thread
 
 
 @dataclass
@@ -267,20 +357,62 @@ def _pop_segments(vad) -> list[np.ndarray]:
     return segments
 
 
-def wait_for_wake(stream, model_path: Path, wake_model, args, stats: RuntimeStats):
+def wait_for_wake(
+    stream,
+    model_path: Path,
+    wake_model,
+    args,
+    stats: RuntimeStats,
+    *,
+    external_playback_gate: ExternalPlaybackGate | None = None,
+):
     discarded = _discard_buffered_microphone(stream)
     if discarded:
         print(f"Discarded {discarded / SAMPLE_RATE:.2f}s of pre-standby microphone buffer")
     wake_vad, window_size = create_vad(model_path)
     pending = np.empty(0, dtype=np.float32)
+    was_suppressed = False
+
+    def renderer_blocked() -> bool:
+        return bool(external_playback_gate and external_playback_gate.is_blocked())
 
     while True:
+        if renderer_blocked():
+            if not was_suppressed:
+                print("Renderer TTS active; wake matching suppressed.")
+            was_suppressed = True
+            _samples, overflowed = _read_microphone(stream, window_size)
+            if overflowed:
+                stats.microphone_overflows += 1
+                print("WARNING: microphone input overflow during renderer TTS suppression")
+            continue
+
+        if was_suppressed:
+            discarded = _discard_buffered_microphone(stream)
+            wake_vad, window_size = create_vad(model_path)
+            pending = np.empty(0, dtype=np.float32)
+            was_suppressed = False
+            if discarded:
+                print(
+                    "Renderer TTS suppression released; discarded "
+                    f"{discarded / SAMPLE_RATE:.2f}s of speaker-tail microphone buffer"
+                )
+
         samples, overflowed = _read_microphone(stream, window_size)
         if overflowed:
             stats.microphone_overflows += 1
             print("WARNING: microphone input overflow during standby")
+
+        if renderer_blocked():
+            was_suppressed = True
+            continue
+
         pending = _feed_vad(wake_vad, window_size, pending, samples)
         for segment in _pop_segments(wake_vad):
+            if renderer_blocked():
+                was_suppressed = True
+                break
+
             seconds = segment.size / SAMPLE_RATE
             if not (MIN_WAKE_CANDIDATE_SECONDS <= seconds <= MAX_WAKE_CANDIDATE_SECONDS):
                 continue
@@ -293,9 +425,15 @@ def wait_for_wake(stream, model_path: Path, wake_model, args, stats: RuntimeStat
                     f"[{'WAKE' if matched else 'speech'}] {transcript!r} "
                     f"| segment={seconds:.2f}s | asr={latency:.2f}s"
                 )
-            if matched:
+
+            blocked_after_asr = renderer_blocked()
+            if matched and not blocked_after_asr:
                 stats.wake_events += 1
                 return transcript, latency
+
+            if blocked_after_asr:
+                was_suppressed = True
+                break
 
 
 def capture_conversation_turn(
@@ -984,6 +1122,9 @@ def run(args: argparse.Namespace) -> int:
         output_device=args.output_device,
         block_frames=BARGE_IN_PLAYBACK_BLOCK_FRAMES,
     )
+    renderer_speech_gate = ExternalPlaybackGate(args.renderer_speaker_tail)
+    if args.voice_control_stdin:
+        _start_voice_control_listener(sys.stdin, renderer_speech_gate)
 
     def accept_barge_in(speech_started_at: float) -> None:
         """Move SPEAKING -> LISTENING the moment cancellation is requested."""
@@ -1053,6 +1194,7 @@ def run(args: argparse.Namespace) -> int:
                             wake_model,
                             args,
                             stats,
+                            external_playback_gate=renderer_speech_gate,
                         )
                     except Exception as exc:
                         _standby_after_failure(controller, f"wake path failed: {exc}")
@@ -1432,6 +1574,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--barge-in-min-rms", type=float, default=DEFAULT_BARGE_IN_MIN_RMS)
     parser.add_argument("--debug-wake-transcripts", action="store_true")
+    parser.add_argument(
+        "--voice-control-stdin",
+        action="store_true",
+        help="Accept trusted Electron renderer-speaking control messages on stdin.",
+    )
+    parser.add_argument(
+        "--renderer-speaker-tail",
+        type=float,
+        default=DEFAULT_RENDERER_SPEAKER_TAIL_SECONDS,
+        help="Seconds to suppress wake matching after renderer TTS ends.",
+    )
     args = parser.parse_args(argv)
     args.turns = max(0, min(int(args.turns), 1000))
     args.command_wait = max(3.0, min(float(args.command_wait), 30.0))
@@ -1445,6 +1598,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.barge_in_min_speech = max(0.10, min(float(args.barge_in_min_speech), 1.0))
     args.barge_in_echo_margin = max(1.2, min(float(args.barge_in_echo_margin), 10.0))
     args.barge_in_min_rms = max(0.001, min(float(args.barge_in_min_rms), 0.25))
+    args.renderer_speaker_tail = max(
+        0.1, min(float(args.renderer_speaker_tail), 2.0)
+    )
     if args.tts_url is None:
         args.tts_url = (
             args.api_url[: -len("/chat")] + "/tts"

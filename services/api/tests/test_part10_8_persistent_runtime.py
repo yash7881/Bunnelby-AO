@@ -375,6 +375,124 @@ class PersistentRuntimePolicyTests(unittest.TestCase):
         self.assertIn("Recovered safely: chat failed; transcript preserved", output.getvalue())
         self.assertIn("Chat failures: 1", output.getvalue())
 
+
+    def test_renderer_speech_gate_blocks_during_playback_and_tail(self) -> None:
+        now = [10.0]
+        gate = wake_conversation_runtime.ExternalPlaybackGate(
+            0.75,
+            clock=lambda: now[0],
+        )
+
+        self.assertFalse(gate.is_blocked())
+        gate.set_renderer_speaking(True)
+        self.assertTrue(gate.is_blocked())
+        now[0] = 50.0
+        self.assertTrue(gate.is_blocked())
+
+        gate.set_renderer_speaking(False)
+        self.assertTrue(gate.is_blocked())
+        now[0] = 50.74
+        self.assertTrue(gate.is_blocked())
+        now[0] = 50.76
+        self.assertFalse(gate.is_blocked())
+
+    def test_renderer_voice_control_requires_strict_boolean_payload(self) -> None:
+        gate = wake_conversation_runtime.ExternalPlaybackGate(0.5)
+
+        self.assertTrue(
+            wake_conversation_runtime._handle_voice_control_line(
+                '{"type":"renderer_speaking","speaking":true}',
+                gate,
+            )
+        )
+        self.assertTrue(gate.is_blocked())
+
+        self.assertFalse(
+            wake_conversation_runtime._handle_voice_control_line(
+                '{"type":"renderer_speaking","speaking":"true"}',
+                gate,
+            )
+        )
+        self.assertFalse(
+            wake_conversation_runtime._handle_voice_control_line(
+                '{"type":"unknown","speaking":false}',
+                gate,
+            )
+        )
+
+    def test_wait_for_wake_drops_candidate_if_renderer_tts_starts_during_asr(
+        self,
+    ) -> None:
+        class SequencedGate:
+            def __init__(self) -> None:
+                self.values = iter(
+                    [False, False, False, True, False, False, False, False]
+                )
+
+            def is_blocked(self) -> bool:
+                return next(self.values, False)
+
+        segment = np.zeros(
+            int(wake_conversation_runtime.SAMPLE_RATE * 0.6),
+            dtype=np.float32,
+        )
+        stats = wake_conversation_runtime.RuntimeStats()
+        stream = Mock()
+
+        with (
+            patch.object(
+                wake_conversation_runtime,
+                "_discard_buffered_microphone",
+                return_value=0,
+            ),
+            patch.object(
+                wake_conversation_runtime,
+                "create_vad",
+                side_effect=lambda _model: (Mock(), wake_conversation_runtime.READ_SAMPLES),
+            ),
+            patch.object(
+                wake_conversation_runtime,
+                "_read_microphone",
+                return_value=(
+                    np.zeros(wake_conversation_runtime.READ_SAMPLES, dtype=np.float32),
+                    False,
+                ),
+            ),
+            patch.object(
+                wake_conversation_runtime,
+                "_feed_vad",
+                side_effect=lambda _vad, _window, pending, _samples: pending,
+            ),
+            patch.object(
+                wake_conversation_runtime,
+                "_pop_segments",
+                return_value=[segment],
+            ),
+            patch.object(
+                wake_conversation_runtime,
+                "transcribe_candidate",
+                return_value=("Hey Bunnelby", 0.01),
+            ) as transcribe,
+            patch.object(
+                wake_conversation_runtime,
+                "wake_match",
+                return_value=True,
+            ),
+        ):
+            transcript, _latency = wake_conversation_runtime.wait_for_wake(
+                stream,
+                Mock(),
+                Mock(),
+                SimpleNamespace(debug_wake_transcripts=False),
+                stats,
+                external_playback_gate=SequencedGate(),
+            )
+
+        self.assertEqual(transcript, "Hey Bunnelby")
+        self.assertEqual(transcribe.call_count, 2)
+        self.assertEqual(stats.wake_candidates, 2)
+        self.assertEqual(stats.wake_events, 1)
+
     def test_input_device_failure_returns_nonzero(self) -> None:
         args = wake_conversation_runtime.parse_args(["--turns", "1"])
         output = io.StringIO()

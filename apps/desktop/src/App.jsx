@@ -6,6 +6,7 @@ import CommandBar from './components/CommandBar';
 import HistoryDrawer from './components/HistoryDrawer';
 import ResponseSurface from './components/ResponseSurface';
 import { createAOVoicePlayer } from './audio/aoVoicePlayer';
+import { createRendererSpeechGuard } from './rendererSpeechGuard.mjs';
 
 const API_BASE_URL = 'http://127.0.0.1:8000';
 const API_URL = `${API_BASE_URL}/chat`;
@@ -141,12 +142,19 @@ export default function App() {
   const voiceMountedRef = useRef(false);
   const layoutModeRef = useRef(layoutMode);
   const voicePlayerRef = useRef(null);
+  const rendererSpeechGuardRef = useRef(null);
   const reducedMotion = useReducedMotion();
 
   layoutModeRef.current = layoutMode;
+  if (!rendererSpeechGuardRef.current) {
+    rendererSpeechGuardRef.current = createRendererSpeechGuard();
+  }
   if (!voicePlayerRef.current) {
     voicePlayerRef.current = createAOVoicePlayer({
       onSpeakingChange: (isSpeaking) => {
+        rendererSpeechGuardRef.current?.setSpeaking(Boolean(isSpeaking));
+        window.bunnelbyVoice?.setRendererSpeaking?.(Boolean(isSpeaking));
+
         setCoreState((current) => {
           if (isSpeaking && layoutModeRef.current === 'response') return 'speaking';
           if (!isSpeaking && current === 'speaking') return 'idle';
@@ -202,6 +210,23 @@ export default function App() {
 
       if (eventType === 'runtime_ready') {
         console.info('Bunnelby persistent voice runtime ready', event);
+        return;
+      }
+
+      const rendererSpeechGuardActive =
+        rendererSpeechGuardRef.current?.isActive?.() === true;
+      if (
+        rendererSpeechGuardActive &&
+        (
+          eventType === 'state' ||
+          eventType === 'wake_detected' ||
+          eventType === 'user_transcript' ||
+          eventType === 'assistant_response'
+        )
+      ) {
+        console.warn(
+          `Ignoring ${eventType} while renderer TTS self-wake guard is active.`
+        );
         return;
       }
 

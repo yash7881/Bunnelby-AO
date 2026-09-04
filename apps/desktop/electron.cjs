@@ -1,15 +1,20 @@
-const { app, BrowserWindow, session } = require('electron');
+const { app, BrowserWindow, ipcMain, session } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const {
+  encodeRendererSpeakingControl
+} = require('./voice-control-protocol.cjs');
 
 const DEV_ORIGIN = 'http://127.0.0.1:5173';
 const VOICE_EVENT_PREFIX = 'BUNNELBY_UI_EVENT ';
+const RENDERER_SPEAKING_CHANNEL = 'bunnelby:renderer-speaking';
 
 let mainWindow = null;
 let voiceProcess = null;
 let rendererReady = false;
+let rendererSpeaking = false;
 let pendingVoiceEvents = [];
 
 function isTrustedRendererUrl(value) {
@@ -20,6 +25,42 @@ function isTrustedRendererUrl(value) {
   } catch {
     return false;
   }
+}
+
+function sendRendererSpeakingState() {
+  if (
+    !voiceProcess ||
+    !voiceProcess.stdin ||
+    voiceProcess.stdin.destroyed ||
+    !voiceProcess.stdin.writable
+  ) {
+    return false;
+  }
+
+  try {
+    voiceProcess.stdin.write(encodeRendererSpeakingControl(rendererSpeaking));
+    return true;
+  } catch (error) {
+    if (!app.isQuitting) {
+      console.error('Failed to send renderer speaking state to voice runtime:', error);
+    }
+    return false;
+  }
+}
+
+function configureVoiceControlBridge() {
+  ipcMain.on(RENDERER_SPEAKING_CHANNEL, (event, isSpeaking) => {
+    const senderUrl =
+      event.senderFrame?.url ||
+      event.sender?.getURL?.() ||
+      '';
+
+    if (!isTrustedRendererUrl(senderUrl)) return;
+    if (typeof isSpeaking !== 'boolean') return;
+
+    rendererSpeaking = isSpeaking;
+    sendRendererSpeakingState();
+  });
 }
 
 function configureSessionSecurity() {
@@ -131,7 +172,8 @@ function startVoiceRuntime() {
     [
       runtimeScript,
       '--turns', '0',
-      '--language', 'auto'
+      '--language', 'auto',
+      '--voice-control-stdin'
     ],
     {
       cwd: repoRoot,
@@ -142,9 +184,16 @@ function startVoiceRuntime() {
         PYTHONUTF8: '1',
         PYTHONIOENCODING: 'utf-8'
       },
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['pipe', 'pipe', 'pipe']
     }
   );
+
+  voiceProcess.stdin.on('error', (error) => {
+    if (!app.isQuitting && error?.code !== 'EPIPE') {
+      console.error('Bunnelby voice control pipe error:', error);
+    }
+  });
+  sendRendererSpeakingState();
 
   const lines = readline.createInterface({
     input: voiceProcess.stdout,
@@ -196,6 +245,7 @@ function stopVoiceRuntime() {
   voiceProcess = null;
 
   try {
+    processToStop.stdin?.end();
     processToStop.kill();
   } catch (error) {
     console.error('Failed to stop Bunnelby voice runtime:', error);
@@ -227,6 +277,8 @@ const createWindow = () => {
 
   mainWindow.webContents.on('did-start-loading', () => {
     rendererReady = false;
+    rendererSpeaking = false;
+    sendRendererSpeakingState();
   });
 
   mainWindow.webContents.on('did-finish-load', () => {
@@ -236,6 +288,8 @@ const createWindow = () => {
 
   mainWindow.on('closed', () => {
     rendererReady = false;
+    rendererSpeaking = false;
+    sendRendererSpeakingState();
     mainWindow = null;
   });
 
@@ -243,6 +297,7 @@ const createWindow = () => {
 };
 
 configureWebContentsSecurity();
+configureVoiceControlBridge();
 
 app.whenReady().then(() => {
   configureSessionSecurity();
