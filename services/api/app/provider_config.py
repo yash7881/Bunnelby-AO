@@ -37,17 +37,22 @@ DEFAULT_GROQ_MODEL: Final[str] = "openai/gpt-oss-120b"
 
 # 10.2.1 Provider Resilience:
 # - 429s fall back quickly instead of pinning Gemini open for 15 minutes.
-# - transport/5xx failures get one small bounded retry, then a short breaker.
+# - transport/5xx failures can use a tiny bounded retry when explicitly enabled.
 # 10.2.2 Provider Latency Guard:
 # - Gemini has an explicit SDK HTTP deadline and SDK retries are disabled so
 #   retry/failover authority stays in Bunnelby's Model Gateway.
+# 10.2.3 Fast Immediate Failover:
+# - live A/B testing showed a same-provider 5xx retry increased /chat latency
+#   from ~9.5s to ~23.5s, so interactive cloud failover is fail-fast by default.
+# - LLM_MAX_TRANSIENT_RETRIES can still opt a non-interactive workload into a
+#   bounded retry later without changing gateway code.
 DEFAULT_GEMINI_COOLDOWN_SECONDS: Final[int] = 120
 DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[int] = 45
 DEFAULT_GEMINI_REQUEST_TIMEOUT_SECONDS: Final[int] = 20
 MAX_GEMINI_REQUEST_TIMEOUT_SECONDS: Final[int] = 60
 DEFAULT_TRANSIENT_COOLDOWN_SECONDS: Final[int] = 30
 DEFAULT_TRANSIENT_RETRY_DELAY_MS: Final[int] = 250
-DEFAULT_MAX_TRANSIENT_RETRIES: Final[int] = 1
+DEFAULT_MAX_TRANSIENT_RETRIES: Final[int] = 0
 
 GROQ_CHAT_COMPLETIONS_URL: Final[str] = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODELS_URL: Final[str] = "https://api.groq.com/openai/v1/models"

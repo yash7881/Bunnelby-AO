@@ -98,6 +98,10 @@ class ProviderLatencyGuardTests(unittest.TestCase):
         with latency_env(GEMINI_REQUEST_TIMEOUT_SECONDS="999"):
             self.assertEqual(model_gateway.gemini_request_timeout_seconds(), 60)
 
+    def test_default_transient_retry_policy_is_fail_fast(self) -> None:
+        with patch.dict(os.environ, {"LLM_MAX_TRANSIENT_RETRIES": ""}, clear=False):
+            self.assertEqual(model_gateway.max_transient_retries(), 0)
+
     def test_timeout_never_retries_the_same_provider(self) -> None:
         calls = 0
 
