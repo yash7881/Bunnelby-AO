@@ -38,8 +38,13 @@ DEFAULT_GROQ_MODEL: Final[str] = "openai/gpt-oss-120b"
 # 10.2.1 Provider Resilience:
 # - 429s fall back quickly instead of pinning Gemini open for 15 minutes.
 # - transport/5xx failures get one small bounded retry, then a short breaker.
+# 10.2.2 Provider Latency Guard:
+# - Gemini has an explicit SDK HTTP deadline and SDK retries are disabled so
+#   retry/failover authority stays in Bunnelby's Model Gateway.
 DEFAULT_GEMINI_COOLDOWN_SECONDS: Final[int] = 120
 DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[int] = 45
+DEFAULT_GEMINI_REQUEST_TIMEOUT_SECONDS: Final[int] = 20
+MAX_GEMINI_REQUEST_TIMEOUT_SECONDS: Final[int] = 60
 DEFAULT_TRANSIENT_COOLDOWN_SECONDS: Final[int] = 30
 DEFAULT_TRANSIENT_RETRY_DELAY_MS: Final[int] = 250
 DEFAULT_MAX_TRANSIENT_RETRIES: Final[int] = 1
@@ -48,7 +53,7 @@ GROQ_CHAT_COMPLETIONS_URL: Final[str] = "https://api.groq.com/openai/v1/chat/com
 GROQ_MODELS_URL: Final[str] = "https://api.groq.com/openai/v1/models"
 GROQ_API_HOST: Final[str] = "api.groq.com"
 
-RECOVERABLE_GEMINI_CODES: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
+RECOVERABLE_GEMINI_CODES: Final[frozenset[int]] = frozenset({408, 429, 500, 502, 503, 504})
 
 PROVIDER_KEY_ENV: Final[dict[str, str]] = {
     "gemini": "GEMINI_API_KEY",
@@ -112,6 +117,16 @@ def gemini_cooldown_seconds() -> int:
 
 def request_timeout_seconds() -> int:
     return env_int("LLM_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS)
+
+
+def gemini_request_timeout_seconds() -> int:
+    return min(
+        MAX_GEMINI_REQUEST_TIMEOUT_SECONDS,
+        env_int(
+            "GEMINI_REQUEST_TIMEOUT_SECONDS",
+            DEFAULT_GEMINI_REQUEST_TIMEOUT_SECONDS,
+        ),
+    )
 
 
 def transient_cooldown_seconds() -> int:

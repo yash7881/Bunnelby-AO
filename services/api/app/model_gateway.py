@@ -26,6 +26,7 @@ from .provider_config import (
     gemini_cooldown_seconds,
     gemini_fast_model_name,
     gemini_model_name,
+    gemini_request_timeout_seconds,
     groq_model_name,
     max_transient_retries,
     model_stability,
@@ -49,8 +50,10 @@ logger = logging.getLogger(__name__)
 # places, cross_tool_fastpath had its own Groq-first policy, only Gemini had a
 # breaker, and a brand-new Gemini client was constructed per request.
 #
-# Part 10.2.1 adds bounded transient retries plus same-process diagnostics. It
-# intentionally does NOT add a real local model; Part 27 attaches one through
+# Part 10.2.1 adds bounded transient retries plus same-process diagnostics.
+# Part 10.2.2 adds explicit Gemini HTTP deadlines and disables provider-SDK
+# retries so the Model Gateway remains the single retry/failover authority.
+# It intentionally does NOT add a real local model; Part 27 attaches one through
 # LocalReasoningProvider without changing the Brain/executor contract.
 
 InferenceProfileName = Literal["balanced", "fast", "low_latency_synthesis", "groq_only"]
@@ -64,6 +67,9 @@ MAX_TRACKED_LATENCIES: Final[int] = 20
 MAX_PROVIDER_EVENTS: Final[int] = 50
 TRANSIENT_RETRY_CODES: Final[frozenset[str]] = frozenset(
     {"transport", "http_500", "http_502", "http_503", "http_504"}
+)
+TRANSIENT_BREAKER_CODES: Final[frozenset[str]] = TRANSIENT_RETRY_CODES | frozenset(
+    {"timeout"}
 )
 GATEWAY_STARTED_AT: Final[datetime] = datetime.now(timezone.utc)
 
@@ -338,24 +344,36 @@ def local_provider() -> LocalReasoningProvider:
 # --------------------------------------------------------------------------- #
 
 _client_lock = threading.Lock()
-_gemini_clients: dict[str, genai.Client] = {}
+_gemini_clients: dict[tuple[str, int], genai.Client] = {}
 
 
 def gemini_client() -> genai.Client:
-    """Return a cached Gemini client for the configured key."""
+    """Return a cached Gemini client with a hard HTTP deadline and no SDK retry.
+
+    Google GenAI's HTTP layer supports its own timeout/retry policy. Bunnelby
+    disables provider-SDK retries (`attempts=1`) so retries and failover happen
+    only in this gateway and remain observable/bounded.
+    """
     api_key = provider_key("gemini")
     if not api_key:
         raise LLMConfigurationError("GEMINI_API_KEY is not configured.")
+
+    timeout_seconds = gemini_request_timeout_seconds()
+    key = (api_key, timeout_seconds)
     with _client_lock:
-        client = _gemini_clients.get(api_key)
+        client = _gemini_clients.get(key)
         if client is None:
-            client = genai.Client(api_key=api_key)
-            _gemini_clients[api_key] = client
+            http_options = types.HttpOptions(
+                timeout=timeout_seconds * 1000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            )
+            client = genai.Client(api_key=api_key, http_options=http_options)
+            _gemini_clients[key] = client
         return client
 
 
 def reset_clients() -> None:
-    """Drop cached clients (used by tests and after a key rotation)."""
+    """Drop cached clients (used by tests and after a key/timeout rotation)."""
     with _client_lock:
         clients = list(_gemini_clients.values())
         _gemini_clients.clear()
@@ -414,6 +432,22 @@ def _exception_retry_after_seconds(exc: BaseException) -> int | None:
     return None
 
 
+def _is_timeout_exception(exc: BaseException) -> bool:
+    """Recognize direct and wrapped timeout exceptions without provider coupling."""
+    if isinstance(exc, TimeoutError):
+        return True
+
+    class_name = exc.__class__.__name__.casefold()
+    if "timeout" in class_name or "timedout" in class_name:
+        return True
+
+    for nested in (getattr(exc, "reason", None), exc.__cause__, exc.__context__):
+        if isinstance(nested, BaseException) and nested is not exc:
+            if _is_timeout_exception(nested):
+                return True
+    return False
+
+
 def _cooldown_for_failure(
     provider: str,
     error_code: str,
@@ -431,7 +465,7 @@ def _cooldown_for_failure(
         )
         return min(configured, DEFAULT_RATE_LIMIT_FALLBACK_SECONDS)
 
-    if error_code in TRANSIENT_RETRY_CODES:
+    if error_code in TRANSIENT_BREAKER_CODES:
         return transient_cooldown_seconds()
 
     return 0
@@ -442,11 +476,12 @@ def _call_with_transient_retry(
     model: str,
     invoke: Callable[[], object],
 ) -> object:
-    """Retry only transport/5xx errors, never auth/config/429 failures.
+    """Retry transport/5xx only; timeout/429/auth/config fail over immediately.
 
     A retry is deliberately tiny and bounded. If it still fails, the caller
     raises to `generate`, which records the breaker and immediately tries the
-    next provider.
+    next provider. A client-side hard timeout is never repeated on the same
+    provider because doing so would double the user's wait.
     """
     retries = max_transient_retries()
     base_delay_ms = transient_retry_delay_ms()
@@ -528,12 +563,16 @@ def _gemini_call(
             )
         except errors.APIError as exc:
             code = int(getattr(exc, "code", 0) or 0)
-            error_code = f"http_{code or 'unknown'}"
+            error_code = "timeout" if code == 408 else f"http_{code or 'unknown'}"
             recoverable = code in RECOVERABLE_GEMINI_CODES
             retry_after = _exception_retry_after_seconds(exc)
             raise _ProviderCallError(
                 error_code=error_code,
-                message=f"Gemini request failed (HTTP {code or 'unknown'}).",
+                message=(
+                    "Gemini request timed out."
+                    if error_code == "timeout"
+                    else f"Gemini request failed (HTTP {code or 'unknown'})."
+                ),
                 recoverable=recoverable,
                 cooldown_seconds=(
                     _cooldown_for_failure(
@@ -548,13 +587,18 @@ def _gemini_call(
         except LLMServiceError:
             raise
         except Exception as exc:
+            error_code = "timeout" if _is_timeout_exception(exc) else "transport"
             raise _ProviderCallError(
-                error_code="transport",
-                message="Gemini request failed before a usable response arrived.",
+                error_code=error_code,
+                message=(
+                    "Gemini request timed out."
+                    if error_code == "timeout"
+                    else "Gemini request failed before a usable response arrived."
+                ),
                 recoverable=True,
                 cooldown_seconds=_cooldown_for_failure(
                     "gemini",
-                    "transport",
+                    error_code,
                     retry_after_seconds=None,
                 ),
             ) from exc
@@ -632,11 +676,15 @@ def _groq_call(
             )
             detail = _groq_error_message(exc.read())
             suffix = f": {detail}" if detail else ""
-            error_code = f"http_{exc.code}"
+            error_code = "timeout" if exc.code == 408 else f"http_{exc.code}"
             recoverable = exc.code in RECOVERABLE_GEMINI_CODES
             raise _ProviderCallError(
                 error_code=error_code,
-                message=f"Groq request failed (HTTP {exc.code}){suffix}",
+                message=(
+                    "Groq request timed out."
+                    if error_code == "timeout"
+                    else f"Groq request failed (HTTP {exc.code}){suffix}"
+                ),
                 recoverable=recoverable,
                 cooldown_seconds=(
                     _cooldown_for_failure(
@@ -649,13 +697,18 @@ def _groq_call(
                 ),
             ) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
+            error_code = "timeout" if _is_timeout_exception(exc) else "transport"
             raise _ProviderCallError(
-                error_code="transport",
-                message="Groq is temporarily unreachable.",
+                error_code=error_code,
+                message=(
+                    "Groq request timed out."
+                    if error_code == "timeout"
+                    else "Groq is temporarily unreachable."
+                ),
                 recoverable=True,
                 cooldown_seconds=_cooldown_for_failure(
                     "groq",
-                    "transport",
+                    error_code,
                     retry_after_seconds=None,
                 ),
             ) from exc
@@ -829,6 +882,8 @@ def provider_status() -> dict[str, object]:
             "transient_cooldown_seconds": transient_cooldown_seconds(),
             "rate_limit_fallback_seconds": DEFAULT_RATE_LIMIT_FALLBACK_SECONDS,
             "max_retry_after_seconds": MAX_RETRY_AFTER_SECONDS,
+            "gemini_request_timeout_seconds": gemini_request_timeout_seconds(),
+            "gemini_sdk_retry_attempts": 1,
         },
         "local_provider": {
             "name": local_provider().name,
@@ -931,8 +986,8 @@ def generate(
     """Run one generation through the profile's provider chain.
 
     The gateway makes at most one *successful* provider call. A provider
-    primitive may perform a small bounded retry for transport/5xx errors before
-    failing over. 429/auth/config failures are never same-provider retry loops.
+    primitive may perform one small bounded retry for transport/5xx errors.
+    Client-side timeouts, 429, auth and config errors fail over immediately.
     """
     spec = profile(profile_name)
     failures: list[str] = []
