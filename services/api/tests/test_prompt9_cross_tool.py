@@ -146,35 +146,24 @@ class Prompt9CrossToolTests(unittest.TestCase):
         with self.assertRaises(cross_tool_reasoning.CrossToolWriteNotSupportedError):
             cross_tool_reasoning.plan_cross_tool_request(request)
 
-    def test_intelligence_facade_uses_cross_tool_result_instead_of_legacy_dispatch(self) -> None:
-        plan = CrossToolPlan(
-            steps=(
-                PlannedStep("gmail.read", "read mail"),
-                PlannedStep("calendar.read", "read calendar"),
-            ),
-            reason="test",
-            source="local_fallback",
-        )
-        cross_result = CrossToolResult(
-            reply="One combined answer.",
-            spoken_reply="One useful spoken answer, sir.",
-            plan=plan,
-            steps=(
-                StepResult(1, "gmail.read", "read mail", "success", {"count": 1}),
-                StepResult(2, "calendar.read", "read calendar", "success", {"busy": []}),
-            ),
-        )
+    def test_intelligence_facade_always_delegates_to_brain_first_dispatch(self) -> None:
+        """intelligence_dispatch is a thin facade: no pre-brain keyword gate runs here.
+
+        Combined Gmail+Calendar requests are routed by brain_agent.decide() choosing
+        tool="cross_tool_read", not by a regex check in this module (see
+        test_brain_v2_policy.py for that routing behavior end to end).
+        """
+        sentinel = object()
         with (
-            patch.object(intelligence_dispatch, "handle_cross_tool_request", return_value=cross_result),
-            patch.object(intelligence_dispatch, "_legacy_dispatch") as legacy,
+            patch.object(intelligence_dispatch, "handle_cross_tool_request") as cross_tool,
+            patch.object(intelligence_dispatch, "_legacy_dispatch", return_value=sentinel) as legacy,
         ):
             result = intelligence_dispatch.handle_message_result(EXAMPLE)
 
-        legacy.assert_not_called()
-        self.assertEqual(result.reply, "One combined answer.")
-        self.assertEqual(result.spoken_reply, "One useful spoken answer, sir.")
-        self.assertEqual(result.action_type, "task_complete")
-        self.assertEqual(result.spoken_metadata["steps_succeeded"], 2)
+        # Part 10.2 Phase D: the facade now forwards the active session id too.
+        legacy.assert_called_once_with(EXAMPLE, session_id=None, turn_id=None)
+        cross_tool.assert_not_called()
+        self.assertIs(result, sentinel)
 
 
 if __name__ == "__main__":

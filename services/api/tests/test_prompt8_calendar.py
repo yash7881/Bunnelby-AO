@@ -10,7 +10,12 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from services.api.app import approval_service, calendar_service, message_dispatch
+from services.api.app import (
+    approval_service,
+    brain_agent,
+    calendar_service,
+    message_dispatch,
+)
 from services.api.app.approval_service import (
     ApprovalConflictError,
     ApprovalPayloadError,
@@ -34,6 +39,26 @@ PROPOSAL = {
     "duration_minutes": 60,
     "assumed_duration": False,
 }
+
+
+def _calendar_create_decision() -> brain_agent.BrainDecision:
+    """Pin the Brain's decision for calendar-dispatch tests.
+
+    These two tests assert what the CALENDAR path does with a create decision.
+    Before Part 10.2 Phase G they reached brain_agent.decide() unmocked and so
+    made live Gemini/Groq calls -- non-deterministic, rate-limit prone and a
+    real quota cost on every suite run. Pinning the decision keeps each
+    assertion exactly as written while removing the live dependency.
+    """
+    return brain_agent.BrainDecision(
+        mode="tool",
+        tool="calendar_create",
+        confidence=0.95,
+        arguments={"title": "Project Review"},
+        reply="",
+        spoken_reply="",
+        reason="test fixture",
+    )
 
 
 class CalendarParsingTests(unittest.TestCase):
@@ -232,6 +257,7 @@ class CalendarApprovalTests(unittest.TestCase):
             patch.object(message_dispatch, "check_free_busy", return_value=[]),
             patch.object(message_dispatch, "create_calendar_event_approval", wraps=create_calendar_event_approval) as create_approval,
             patch.object(approval_service, "create_event") as external_create,
+            patch.object(brain_agent, "decide", return_value=_calendar_create_decision()),
         ):
             result = message_dispatch.handle_message_result(
                 "Schedule Project Review tomorrow at 3 PM with rahul@example.com"
@@ -259,6 +285,7 @@ class CalendarApprovalTests(unittest.TestCase):
                 "end": parsed.end.isoformat(),
             }]),
             patch.object(message_dispatch, "create_calendar_event_approval") as create_approval,
+            patch.object(brain_agent, "decide", return_value=_calendar_create_decision()),
         ):
             result = message_dispatch.handle_message_result(
                 "Schedule Project Review tomorrow at 3 PM"

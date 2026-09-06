@@ -6,9 +6,21 @@ import CommandBar from './components/CommandBar';
 import HistoryDrawer from './components/HistoryDrawer';
 import ResponseSurface from './components/ResponseSurface';
 import { createAOVoicePlayer } from './audio/aoVoicePlayer';
+import { createRendererSpeechGuard } from './rendererSpeechGuard.mjs';
 
 const API_BASE_URL = 'http://127.0.0.1:8000';
 const API_URL = `${API_BASE_URL}/chat`;
+
+// Part 10.2 Phase D: one identifier for this desktop chat session. Every /chat
+// request carries it so the backend scopes conversational memory to this
+// session and never treats an earlier conversation as the active topic.
+function createSessionId() {
+  const random =
+    globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 16)
+      : Math.random().toString(16).slice(2).padEnd(16, '0').slice(0, 16);
+  return `sess-${random}`;
+}
 const PROCESSING_HINT_DELAY = 700;
 
 const APPROVAL_FIXTURE = {
@@ -105,6 +117,8 @@ async function backendError(response) {
 
 export default function App() {
   // Layout and Core state intentionally remain independent for future voice/TTS events.
+  // Stable for the lifetime of this window: one desktop chat session.
+  const sessionIdRef = useRef(createSessionId());
   const [initialSetup] = useState(getDevelopmentSetup);
   const [layoutMode, setLayoutMode] = useState(initialSetup.response ? 'response' : 'home');
   const [coreState, setCoreState] = useState('idle');
@@ -128,12 +142,19 @@ export default function App() {
   const voiceMountedRef = useRef(false);
   const layoutModeRef = useRef(layoutMode);
   const voicePlayerRef = useRef(null);
+  const rendererSpeechGuardRef = useRef(null);
   const reducedMotion = useReducedMotion();
 
   layoutModeRef.current = layoutMode;
+  if (!rendererSpeechGuardRef.current) {
+    rendererSpeechGuardRef.current = createRendererSpeechGuard();
+  }
   if (!voicePlayerRef.current) {
     voicePlayerRef.current = createAOVoicePlayer({
       onSpeakingChange: (isSpeaking) => {
+        rendererSpeechGuardRef.current?.setSpeaking(Boolean(isSpeaking));
+        window.bunnelbyVoice?.setRendererSpeaking?.(Boolean(isSpeaking));
+
         setCoreState((current) => {
           if (isSpeaking && layoutModeRef.current === 'response') return 'speaking';
           if (!isSpeaking && current === 'speaking') return 'idle';
@@ -176,6 +197,147 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  useEffect(() => {
+    const bridge = window.bunnelbyVoice;
+    if (!bridge?.onEvent) return undefined;
+
+    return bridge.onEvent((event) => {
+      if (!event || typeof event !== 'object') return;
+
+      const eventType = String(event.event || '');
+
+      if (eventType === 'runtime_ready') {
+        console.info('Bunnelby persistent voice runtime ready', event);
+        return;
+      }
+
+      const rendererSpeechGuardActive =
+        rendererSpeechGuardRef.current?.isActive?.() === true;
+      if (
+        rendererSpeechGuardActive &&
+        (
+          eventType === 'state' ||
+          eventType === 'wake_detected' ||
+          eventType === 'user_transcript' ||
+          eventType === 'assistant_response'
+        )
+      ) {
+        console.warn(
+          `Ignoring ${eventType} while renderer TTS self-wake guard is active.`
+        );
+        return;
+      }
+
+      if (eventType === 'state') {
+        const voiceState = String(event.state || '').toLowerCase();
+
+        if (voiceState === 'listening') {
+          setCoreState('listening');
+          return;
+        }
+
+        if (voiceState === 'follow_up') {
+          setCoreState('listening');
+          setSending(false);
+          return;
+        }
+
+        if (voiceState === 'transcribing' || voiceState === 'thinking') {
+          setCoreState('thinking');
+          setSending(true);
+          return;
+        }
+
+        if (voiceState === 'speaking') {
+          setCoreState('speaking');
+          return;
+        }
+
+        if (voiceState === 'standby') {
+          setCoreState('idle');
+          setSending(false);
+        }
+
+        return;
+      }
+
+      if (eventType === 'wake_detected') {
+        if (voiceFrameRef.current) {
+          window.cancelAnimationFrame(voiceFrameRef.current);
+          voiceFrameRef.current = 0;
+        }
+        voicePlayerRef.current?.stop();
+        setAudioLevel(0);
+        setHistoryOpen(false);
+        setMessage('');
+        setActiveResponse(null);
+        setLayoutMode('home');
+        setCoreState('listening');
+        return;
+      }
+
+      if (eventType === 'user_transcript') {
+        const transcript = String(event.text || '').trim();
+        if (!transcript) return;
+
+        setHistoryOpen(false);
+        setMessage('');
+        setActiveResponse(null);
+        setLayoutMode('processing');
+        setCoreState('thinking');
+        setSending(true);
+        setMessages((current) => [
+          ...current,
+          {
+            role: 'user',
+            content: transcript,
+            source: 'voice',
+            time: new Date().toISOString()
+          }
+        ]);
+        return;
+      }
+
+      if (eventType === 'assistant_response') {
+        const rawReply = String(event.reply || '').trim();
+        const parsed = parseAssistantReply(rawReply);
+        const approval =
+          event.approval && typeof event.approval === 'object'
+            ? event.approval
+            : null;
+        const hasApproval =
+          approval && approval.task_type === 'gmail_reply';
+
+        const assistantMessage = {
+          role: 'assistant',
+          kind: hasApproval ? 'approval' : 'normal',
+          title: hasApproval ? 'Review Gmail reply' : undefined,
+          approval: hasApproval ? approval : undefined,
+          approvalBusy: false,
+          approvalError: '',
+          decisionMessage: '',
+          content: parsed.main || rawReply || 'Bunnelby completed the voice request.',
+          route: parsed.route,
+          why: parsed.why,
+          source: 'voice',
+          time: new Date().toISOString()
+        };
+
+        setMessages((current) => [...current, assistantMessage]);
+        setActiveResponse(assistantMessage);
+        setLayoutMode('response');
+        setSending(false);
+        return;
+      }
+
+      if (eventType === 'runtime_error' || eventType === 'runtime_exit') {
+        console.error('Bunnelby voice runtime:', event.message || eventType);
+        setSending(false);
+        setCoreState('idle');
+      }
+    });
   }, []);
 
   useEffect(() => {
@@ -235,7 +397,7 @@ export default function App() {
       const response = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: trimmed })
+        body: JSON.stringify({ message: trimmed, session_id: sessionIdRef.current })
       });
 
       if (!response.ok) throw new Error(await backendError(response));

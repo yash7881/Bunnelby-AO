@@ -9,6 +9,10 @@ const RMS_NOISE_FLOOR = 0.015;
 const RMS_GAIN = 8;
 const LEVEL_ATTACK = 0.35;
 const LEVEL_DECAY = 0.65;
+const SELF_WAKE_ARM_DELAY_MS = 80;
+
+const wait = (milliseconds) =>
+  new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 
 function disconnect(node) {
   try {
@@ -194,8 +198,14 @@ export function createAOVoicePlayer({
         notifySpeaking(false);
       };
 
-      sourceNode.start();
+      // Signal Electron/Python before any speaker samples can exist. The tiny
+      // arm delay gives the persistent microphone loop at least one control/frame
+      // boundary to observe suppression before WebAudio starts.
       notifySpeaking(true);
+      await wait(SELF_WAKE_ARM_DELAY_MS);
+      if (playbackGeneration !== generation || !sourceNode) return false;
+
+      sourceNode.start();
       trackAmplitude(playbackGeneration);
       return true;
     } catch (error) {

@@ -33,7 +33,7 @@ export default function CommandBar({
         aria-label={isListening ? 'Stop listening preview' : 'Preview listening state'}
         aria-pressed={isListening}
         disabled={isProcessing}
-        title="Voice input arrives in a later phase"
+        title="Voice wake is active: say Hey Bunnelby or Hello Bunnelby"
       >
         <span className="mic-glyph" aria-hidden="true" />
       </button>

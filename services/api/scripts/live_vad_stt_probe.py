@@ -8,6 +8,7 @@ import time
 import urllib.request
 import wave
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # When this file is launched directly (python services/api/scripts/...), Python puts only
 # the script directory on sys.path. Add the repository root so `services.api...` imports
@@ -24,6 +25,24 @@ from services.api.app.vad_service import create_voice_activity_detector, vad_mod
 SILERO_VAD_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
 )
+SILERO_VAD_HOST = "github.com"
+SILERO_VAD_PATH = "/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+
+
+def _validated_silero_url() -> str:
+    parsed = urlsplit(SILERO_VAD_URL)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != SILERO_VAD_HOST
+        or parsed.port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != SILERO_VAD_PATH
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("Silero VAD source failed the fixed HTTPS allowlist.")
+    return SILERO_VAD_URL
 
 
 def ensure_vad_model() -> Path:
@@ -34,8 +53,13 @@ def ensure_vad_model() -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".part")
     print(f"Downloading Silero VAD model once to: {target}")
+    source_url = _validated_silero_url()
     try:
-        with urllib.request.urlopen(SILERO_VAD_URL, timeout=60) as response, partial.open("wb") as out:
+        # The source is a compile-time constant validated for exact HTTPS host/path above.
+        with urllib.request.urlopen(  # nosec B310
+            source_url,
+            timeout=60,
+        ) as response, partial.open("wb") as out:
             while True:
                 chunk = response.read(64 * 1024)
                 if not chunk:

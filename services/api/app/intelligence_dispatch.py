@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 
+from .cross_tool_fastpath import handle_cross_tool_fast_request
 from .cross_tool_reasoning import (
     CrossToolWriteNotSupportedError,
-    handle_cross_tool_request,
     is_cross_tool_request,
 )
 from .message_dispatch import handle_message_result as _legacy_dispatch
@@ -12,56 +12,38 @@ from .orchestrator import OrchestratorResult
 
 logger = logging.getLogger(__name__)
 
+# Kept for backward compatibility: some callers/tests still reference these symbols on
+# this module. They are no longer consulted by handle_message_result below -- the single
+# semantic authority for every turn, including explicit combined Gmail+Calendar reads, is
+# brain_agent.decide() (invoked from message_dispatch.handle_message_result), which routes
+# to tool_executor.execute(). tool_executor's cross_tool_read branch is what now calls
+# handle_cross_tool_fast_request.
+handle_cross_tool_request = handle_cross_tool_fast_request
 
-def handle_message_result(user_message: str) -> OrchestratorResult:
-    """Top-level intelligence facade introduced in Part 9.
+__all__ = [
+    "handle_message_result",
+    "handle_cross_tool_request",
+    "is_cross_tool_request",
+    "CrossToolWriteNotSupportedError",
+]
 
-    Cross-tool reasoning lives here while existing single-tool Gmail/Calendar behavior
-    remains delegated to the proven dispatcher. Future parts can migrate tools behind the
-    registry without changing the /chat API contract.
+
+def handle_message_result(
+    user_message: str,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+) -> OrchestratorResult:
+    """Top-level intelligence facade.
+
+    This used to run its own pre-brain keyword gate here (`is_cross_tool_request(...)`)
+    and, on a match, execute a combined Gmail+Calendar read *before* the semantic brain
+    ever saw the message -- which caused real Gmail/Calendar API calls on purely
+    conceptual questions like "Explain the difference between Gmail and Google Calendar"
+    whenever both sets of keywords appeared together.
+
+    There is now exactly one semantic authority: brain_agent.decide(), reached via
+    message_dispatch.handle_message_result. This facade always delegates to it. Explicit
+    combined-read requests are still supported, but only after the brain has classified
+    the turn as mode="tool", tool="cross_tool_read" -- see tool_executor.execute().
     """
-    if not is_cross_tool_request(user_message):
-        return _legacy_dispatch(user_message)
-
-    try:
-        result = handle_cross_tool_request(user_message)
-    except CrossToolWriteNotSupportedError as exc:
-        message = str(exc)
-        return OrchestratorResult(
-            reply=message,
-            action_type="error",
-            memory_content=message,
-            spoken_reply=(
-                "Combined tool actions are read-only right now, sir. Request the write separately so I can preserve the approval check."
-            ),
-        )
-    except Exception as exc:
-        logger.exception("Part 9 cross-tool request failed: %s", exc)
-        return OrchestratorResult(
-            reply=(
-                "I couldn't complete the combined Gmail and Calendar request right now. "
-                "Neither service was changed."
-            ),
-            action_type="error",
-            memory_content=(
-                "I couldn't complete the combined Gmail and Calendar request right now. Neither service was changed."
-            ),
-            spoken_reply="I couldn't complete the combined check right now, sir. Nothing was changed.",
-        )
-
-    succeeded = sum(step.status == "success" for step in result.steps)
-    failed = len(result.steps) - succeeded
-    status_note = f"Cross-tool plan: {succeeded} succeeded, {failed} failed."
-    return OrchestratorResult(
-        reply=result.reply,
-        action_type="task_complete" if succeeded else "error",
-        memory_content=f"{result.reply}\n{status_note}",
-        spoken_reply=result.spoken_reply,
-        spoken_metadata={
-            "cross_tool": True,
-            "steps_total": len(result.steps),
-            "steps_succeeded": succeeded,
-            "steps_failed": failed,
-            "plan_source": result.plan.source,
-        },
-    )
+    return _legacy_dispatch(user_message, session_id=session_id, turn_id=turn_id)

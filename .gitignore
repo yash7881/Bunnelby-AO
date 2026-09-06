@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 .venv/
 .venv-tts/
+.venv-wake/
 venv/
 .pytest_cache/
 .mypy_cache/
@@ -45,9 +46,11 @@ config/credentials*.json
 # AO local personal profile / memory metadata
 database/ao_user_profile.json
 
-# Piper voice models are runtime assets stored outside the repository
+# Local runtime ML / voice model assets
 *.onnx
 *.onnx.json
+*.ppn
+*.pv
 
 # Bunnelby Voice Lab local assets / generated audio
 voice_lab_output/

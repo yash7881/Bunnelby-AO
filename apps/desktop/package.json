@@ -7,7 +7,8 @@
     "dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "dev:web": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:self-wake": "node --test scripts/test-self-wake-bridge.cjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",

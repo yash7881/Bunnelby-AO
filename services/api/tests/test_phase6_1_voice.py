@@ -5,7 +5,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from services.api.app import llm_service, main, orchestrator
+from services.api.app import llm_service, main, model_gateway, orchestrator
 from services.api.app.acknowledgments import (
     detect_spoken_language,
     normalize_spoken_text,
@@ -44,7 +44,7 @@ class Phase61VoicePolicyTests(unittest.TestCase):
             patch.object(orchestrator, "build_memory_context", return_value="LOCAL CONTEXT"),
             patch.object(
                 orchestrator,
-                "generate_text",
+                "generate_fast_text",
                 return_value=LLMResult(text=payload, provider="groq", model="test"),
             ) as generate,
         ):
@@ -91,7 +91,7 @@ class Phase61VoicePolicyTests(unittest.TestCase):
             patch.object(orchestrator, "build_memory_context", return_value="LOCAL CONTEXT"),
             patch.object(
                 orchestrator,
-                "generate_text",
+                "generate_fast_text",
                 return_value=LLMResult(text=payload, provider="gemini", model="test"),
             ) as generate,
         ):
@@ -177,19 +177,22 @@ class Phase61VoicePolicyTests(unittest.TestCase):
 
     def test_gemini_failure_preserves_groq_output_contract_without_summary_call(self) -> None:
         llm_service.clear_gemini_cooldown()
+        self.addCleanup(llm_service.clear_gemini_cooldown)
         fallback = LLMResult(
             text='{"reply":"Screen","spoken_reply":"Speech"}',
             provider="groq",
             model="fallback-test",
         )
+        # Part 10.2 Phase E: the failover contract is unchanged, but it is now
+        # enforced by the Model Gateway, so the provider primitives are the seam.
         with (
             patch.dict(os.environ, {"GEMINI_API_KEY": "test", "GROQ_API_KEY": "test"}),
             patch.object(
-                llm_service,
-                "_gemini_generate",
+                model_gateway,
+                "_gemini_call",
                 side_effect=LLMUnavailableError("forced primary failure"),
             ) as primary,
-            patch.object(llm_service, "generate_groq_text", return_value=fallback) as secondary,
+            patch.object(model_gateway, "_groq_call", return_value=fallback) as secondary,
         ):
             result = llm_service.generate_text(system_instruction="system", user_content="user")
 

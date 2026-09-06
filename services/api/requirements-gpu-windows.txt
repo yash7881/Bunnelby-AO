@@ -1,0 +1,10 @@
+# Optional Windows GPU runtime for Bunnelby faster-whisper / CTranslate2.
+# Keep separate from the default requirements so CPU-only development and CI
+# do not download ~1+ GB of NVIDIA runtime libraries unnecessarily.
+#
+# Current CTranslate2 4.8.x GPU path requires CUDA 12 cuBLAS and cuDNN 9.
+# These are NVIDIA-published Windows x86-64 wheels and do not replace the
+# installed NVIDIA display driver.
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.25.1.1

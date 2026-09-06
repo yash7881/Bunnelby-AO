@@ -1,10 +1,11 @@
-fastapi==0.116.1
+fastapi==0.141.1
+starlette==1.6.0
 uvicorn[standard]==0.35.0
 SQLAlchemy==2.0.43
 alembic==1.16.5
 pydantic==2.12.5
 google-genai==2.20.0
-python-dotenv==1.1.1
+python-dotenv==1.2.3
 google-api-python-client==2.199.0
 google-auth==2.57.0
 google-auth-oauthlib==1.4.1
@@ -17,3 +18,19 @@ tzlocal==5.3.1
 faster-whisper==1.2.0
 sherpa-onnx==1.13.6
 sounddevice==0.5.6
+# Part 11 local file search. Part 11.1 OCR needs no additional package:
+# PyMuPDF drives Tesseract natively via Page.get_textpage_ocr(), and
+# Tesseract itself is a separate local SYSTEM install, not a wheel.
+PyMuPDF==1.28.2
+python-docx==1.2.0
+python-pptx==1.0.2
+openpyxl==3.1.5
+# Imported by local_files/extractors.py for safe XML parsing. Was missing
+# from this manifest, so a fresh clone could not import the package at all.
+defusedxml==0.7.1
+
+# Part 12.1 desktop control. Window enumeration/focus/close use only stdlib
+# ctypes; comtypes is needed ONLY for the optional UI Automation inspector and
+# is Windows-only, so the marker keeps non-Windows installs working. The
+# provider degrades to 'unavailable' if it is missing.
+comtypes==1.4.8; sys_platform == "win32"

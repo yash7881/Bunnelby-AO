@@ -5,7 +5,7 @@ from datetime import datetime
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from services.api.app import calendar_agenda_service, message_dispatch
+from services.api.app import brain_agent, calendar_agenda_service, message_dispatch, tool_executor
 
 
 ZONE = ZoneInfo("Asia/Kolkata")
@@ -73,14 +73,21 @@ class CalendarAgendaQueryTests(unittest.TestCase):
                 "location": "",
             }
         ]
+        decision = brain_agent.BrainDecision(
+            mode="tool",
+            tool="calendar_read",
+            confidence=0.95,
+            reply="",
+            spoken_reply="",
+            reason="explicit agenda read",
+        )
         with (
+            patch.object(brain_agent, "decide", return_value=decision),
             patch.object(message_dispatch, "agenda_range", return_value=(start, end, ZONE)),
             patch.object(message_dispatch, "list_events", return_value=events),
-            patch.object(message_dispatch, "_base_handle_message_result") as general_chat,
         ):
             result = message_dispatch.handle_message_result("today my time table?")
 
-        general_chat.assert_not_called()
         self.assertEqual(result.action_type, "calendar_read")
         self.assertIn("Calendar Source of Truth", result.reply)
         self.assertNotIn("email", result.reply.casefold())

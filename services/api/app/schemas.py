@@ -50,6 +50,9 @@ class ApprovalDecisionResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=MAX_CHAT_MESSAGE_CHARS)
+    # Part 10.2 Phase D. Optional on purpose: a caller that predates sessions
+    # still works and simply gets a fresh isolated session for that turn.
+    session_id: str | None = Field(default=None, max_length=128)
 
     @field_validator("message")
     @classmethod
@@ -64,11 +67,16 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+    # Echoed so a client that did not supply one can reuse the session Bunnelby
+    # minted, keeping a conversation continuous across turns.
+    session_id: str | None = None
+    turn_id: str | None = None
     spoken_reply: str | None = None
     spoken_ack: str | None = None
     spoken_language: Literal["en", "hi"] | None = None
     action_type: str | None = None
     approval: ApprovalResponse | None = None
+    latency_ms: dict[str, float] | None = None
 
 
 class TTSRequest(BaseModel):

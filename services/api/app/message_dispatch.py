@@ -36,7 +36,11 @@ from .gmail_service import (
     GmailServiceError,
     draft_new_email_from_request,
 )
-from .orchestrator import OrchestratorResult, handle_message_result as _base_handle_message_result
+from dataclasses import replace
+
+from . import brain_agent
+from .orchestrator import OrchestratorResult
+from .tool_requests import build_request
 from .spoken_briefing import (
     calendar_agenda_briefing,
     calendar_free_busy_briefing,
@@ -93,12 +97,31 @@ def _normalize_calendar_time_language(user_message: str) -> str:
 
 
 def _standalone_email_requested(user_message: str) -> bool:
-    return bool(
-        _EMAIL_RE.search(user_message)
-        and _COMPOSE_ACTION_RE.search(user_message)
-        and not _REPLY_RE.search(user_message)
-        and not _CALENDAR_CUE_RE.search(user_message)
+    """Detect an explicit NEW-email action.
+
+    An exact address is ideal but no longer mandatory here: Bunnelby may
+    conservatively resolve a named recipient from the user's Gmail history.
+    Reply commands remain on the existing reply-thread path.
+    """
+    text = user_message.strip()
+    if not text:
+        return False
+
+    if _REPLY_RE.search(text) or _CALENDAR_CUE_RE.search(text):
+        return False
+
+    has_email_word = bool(
+        re.search(r"\b(?:email|e-mail|mail|gmail)\b", text, re.IGNORECASE)
     )
+    has_compose_action = bool(
+        re.search(
+            r"\b(?:send|compose|write|draft|bhej(?:o|na)?|bhejo|karo|kro|likho)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+    return bool(has_email_word and has_compose_action)
 
 
 def _calendar_requested(user_message: str) -> bool:
@@ -136,171 +159,10 @@ def _result(
     )
 
 
-def _calendar_agenda_result(user_message: str) -> OrchestratorResult:
-    language = detect_spoken_language(user_message)
-    try:
-        normalized_message = _normalize_calendar_time_language(user_message)
-        start, end, _zone = agenda_range(normalized_message)
-        events = list_events((start, end))
-        reply = format_agenda_response(start, events)
-        spoken = calendar_agenda_briefing(start, events, language)
-        return _result(
-            reply,
-            spoken_reply=spoken,
-            action_type="calendar_read",
-            route="calendar",
-            reason="verified Google Calendar agenda lookup",
-        )
-    except CalendarParseError as exc:
-        return _result(
-            str(exc),
-            spoken_reply=(
-                "शेड्यूल देखने के लिए तारीख थोड़ी और स्पष्ट बताइए।"
-                if language == "hi"
-                else "I need a clearer date before I can read your schedule."
-            ),
-            action_type="error",
-            route="calendar",
-            reason="calendar agenda date requires clarification",
-        )
-    except CalendarConfigurationError as exc:
-        return _result(
-            f"Bunnelby Calendar setup is incomplete: {exc}",
-            spoken_reply="Calendar setup is incomplete. Nothing was changed.",
-            action_type="error",
-            route="calendar",
-            reason="calendar configuration error",
-        )
-    except CalendarAuthorizationError as exc:
-        return _result(
-            f"Bunnelby could not authorize Google Calendar: {exc}",
-            spoken_reply="Google Calendar authorization is required. Nothing was changed.",
-            action_type="error",
-            route="calendar",
-            reason="calendar authorization error",
-        )
-    except CalendarRateLimitError:
-        return _result(
-            "Google Calendar API rate limit reached. Please retry in a moment.",
-            spoken_reply="Google Calendar is temporarily rate-limited. Nothing was changed.",
-            action_type="error",
-            route="calendar",
-            reason="calendar rate limit",
-        )
-    except CalendarServiceError as exc:
-        logger.warning("Calendar agenda request failed: %s", exc)
-        return _result(
-            f"Bunnelby could not read your Google Calendar schedule: {exc}",
-            spoken_reply="I couldn't read your Google Calendar schedule right now.",
-            action_type="error",
-            route="calendar",
-            reason="calendar agenda service error",
-        )
-
-
-def _calendar_result(user_message: str) -> OrchestratorResult:
-    language = detect_spoken_language(user_message)
-    try:
-        normalized_message = _normalize_calendar_time_language(user_message)
-        request = parse_calendar_request(normalized_message)
-
-        if request.action == "create_event":
-            busy = check_free_busy((request.start, request.end))
-            if busy:
-                reply = (
-                    "That requested time overlaps an existing busy period. Nothing was created. "
-                    "Choose another time or ask me to find an open slot."
-                )
-                spoken = (
-                    "उस समय आपका कैलेंडर व्यस्त है। कुछ भी नहीं बनाया गया।"
-                    if language == "hi"
-                    else "That time overlaps something already on your calendar. Nothing was created."
-                )
-                return _result(reply, spoken_reply=spoken, action_type="calendar_read", route="calendar", reason="calendar conflict check")
-
-            proposal = calendar_event_proposal(request)
-            approval = create_calendar_event_approval(proposal, spoken_language=language)
-            public = approval_public_dict(approval)
-            assumption = (
-                " I used a 60-minute duration because you did not specify one; review the end time before approving."
-                if request.assumed_duration
-                else ""
-            )
-            return _result(
-                "I've prepared the calendar event. Review the exact title, time, timezone, and attendees before I create anything."
-                + assumption,
-                spoken_reply=(
-                    "मैंने कैलेंडर इवेंट तैयार कर दिया है। बनाने से पहले आपकी मंज़ूरी चाहिए।"
-                    if language == "hi"
-                    else "I've prepared the calendar event. Review it before I create anything."
-                ),
-                action_type="approval_required",
-                route="calendar",
-                reason="calendar event requires explicit approval",
-                approval=public,
-            )
-
-        if request.action == "open_slots":
-            slots = find_open_slots(
-                request.start.date(),
-                request.duration_minutes,
-                request.work_hours,
-            )
-            reply = format_open_slots_response(request, slots)
-            spoken = calendar_open_slots_briefing(request, slots, language)
-            return _result(reply, spoken_reply=spoken, action_type="calendar_read", route="calendar", reason="calendar open-slot lookup")
-
-        busy = check_free_busy((request.start, request.end))
-        reply = format_free_busy_response(request, busy)
-        spoken = calendar_free_busy_briefing(request, busy, language)
-        return _result(reply, spoken_reply=spoken, action_type="calendar_read", route="calendar", reason="calendar free-busy lookup")
-
-    except CalendarParseError as exc:
-        return _result(
-            str(exc),
-            spoken_reply=(
-                "कैलेंडर अनुरोध के लिए तारीख या समय थोड़ा और स्पष्ट बताइए।"
-                if language == "hi"
-                else "I need a clearer date or time before I can use the calendar safely."
-            ),
-            action_type="error",
-            route="calendar",
-            reason="calendar time parsing requires clarification",
-        )
-    except CalendarConfigurationError as exc:
-        return _result(
-            f"Bunnelby Calendar setup is incomplete: {exc}",
-            spoken_reply="Calendar setup is incomplete. Nothing was changed.",
-            action_type="error",
-            route="calendar",
-            reason="calendar configuration error",
-        )
-    except CalendarAuthorizationError as exc:
-        return _result(
-            f"Bunnelby could not authorize Google Calendar: {exc}",
-            spoken_reply="Google Calendar authorization is required. Nothing was changed.",
-            action_type="error",
-            route="calendar",
-            reason="calendar authorization error",
-        )
-    except CalendarRateLimitError:
-        return _result(
-            "Google Calendar API rate limit reached. Please retry in a moment.",
-            spoken_reply="Google Calendar is temporarily rate-limited. Nothing was changed.",
-            action_type="error",
-            route="calendar",
-            reason="calendar rate limit",
-        )
-    except CalendarServiceError as exc:
-        logger.warning("Calendar request failed: %s", exc)
-        return _result(
-            f"Bunnelby could not complete the Calendar request: {exc}",
-            spoken_reply="I couldn't complete that calendar request. Nothing unsafe was changed.",
-            action_type="error",
-            route="calendar",
-            reason="calendar service error",
-        )
-
+# Part 10.2 Phase M: _calendar_agenda_result and _calendar_result were removed.
+# They were the pre-Phase-G untyped calendar builders and had zero production
+# and zero test callers once tool_execution.execute_calendar_read took over.
+# _gmail_compose_result below is retained: tests still call it directly.
 
 def _gmail_compose_result(user_message: str) -> OrchestratorResult:
     language = detect_spoken_language(user_message)
@@ -321,7 +183,31 @@ def _gmail_compose_result(user_message: str) -> OrchestratorResult:
             approval=public,
         )
     except GmailDraftError as exc:
-        return _result(f"I couldn't create the new Gmail draft: {exc}", spoken_reply="I couldn't prepare that new email. Nothing was sent.", action_type="error", route="gmail", reason="gmail draft error")
+        detail = str(exc)
+        clarification = bool(
+            re.search(
+                r"(multiple|which one|identify|recipient|exact email|exact address|correspondent|matching)",
+                detail,
+                re.IGNORECASE,
+            )
+        )
+        return _result(
+            detail if clarification else f"I couldn't create the new Gmail draft: {detail}",
+            spoken_reply=(
+                "???? ??? ??????? ????? ?? ??? ????? ?? ??????? ??????"
+                if language == "hi" and clarification
+                else "I need one more detail to identify the correct recipient."
+                if clarification
+                else "I couldn't prepare that new email. Nothing was sent."
+            ),
+            action_type="clarification_required" if clarification else "error",
+            route="gmail",
+            reason=(
+                "gmail recipient clarification required"
+                if clarification
+                else "gmail draft error"
+            ),
+        )
     except GmailConfigurationError as exc:
         return _result(f"Bunnelby Gmail setup is incomplete: {exc}", spoken_reply="Gmail setup is incomplete. Nothing was sent.", action_type="error", route="gmail", reason="gmail configuration error")
     except GmailAuthorizationError as exc:
@@ -333,12 +219,48 @@ def _gmail_compose_result(user_message: str) -> OrchestratorResult:
         return _result(f"Bunnelby could not prepare the new Gmail message: {exc}", spoken_reply="I couldn't prepare that email. Nothing was sent.", action_type="error", route="gmail", reason="gmail service error")
 
 
-def handle_message_result(user_message: str) -> OrchestratorResult:
-    """Active dispatch layer for production tool handlers before generic intent fallback."""
-    if _standalone_email_requested(user_message):
-        return _gmail_compose_result(user_message)
-    if is_agenda_request(user_message):
-        return _calendar_agenda_result(user_message)
-    if _calendar_requested(user_message):
-        return _calendar_result(user_message)
-    return _base_handle_message_result(user_message)
+def handle_message_result(
+    user_message: str,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+) -> OrchestratorResult:
+    """Brain-first dispatch: a single semantic LLM decision routes every turn.
+
+    A deterministic regex gate no longer runs before the LLM sees the message. Instead
+    brain_agent.decide() classifies the turn (answer / clarify / tool), and only a
+    mode=="tool" decision reaches deterministic execution via tool_executor, which in turn
+    reuses the existing builder functions below (_gmail_compose_result, _calendar_result,
+    _calendar_agenda_result) purely as execution helpers.
+    """
+    # tool_executor imports this module for its execution builders, so that one
+    # import stays deferred until Phase G moves the builders out. brain_agent no
+    # longer imports the legacy router, so it is a normal module-level import.
+    from . import tool_executor
+
+    decision = brain_agent.decide(user_message, session_id=session_id)
+
+    if decision.mode == "tool":
+        return tool_executor.execute(
+            decision, user_message, session_id=session_id, turn_id=turn_id
+        )
+
+    # Phase G: answers run through the same Capability Registry as tools, so the
+    # registry is the single execution authority. memory_content keeps its exact
+    # prior shape (including the brain's own reason) for memory compatibility.
+    reply = decision.reply
+    request = build_request(
+        "general_answer",
+        user_message,
+        {
+            "reply": reply,
+            "spoken_reply": decision.spoken_reply,
+            "is_clarification": decision.mode == "clarify",
+        },
+    )
+    result = tool_executor.execute_answer(
+        request, session_id=session_id, turn_id=turn_id
+    )
+    return replace(
+        result,
+        memory_content=f"{reply}\nRoute: brain\nWhy: {decision.reason or decision.mode}",
+    )
