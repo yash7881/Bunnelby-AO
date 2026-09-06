@@ -143,6 +143,19 @@ their real Gmail or Calendar:
 "Explain Alt+Tab" are explanations, not desktop actions: answer them conversationally. The
 mere appearance of an application name is never enough to select desktop_control.
 
+When you do select desktop_control, "action" is a CANONICAL TOKEN, not a natural-language
+verb. Use exactly one of: list_windows, inspect_window, find_control, open_app, focus_app,
+close_app, safe_shortcut. Worked examples:
+  "Open Notepad"              -> {"action": "open_app",     "target": "notepad"}
+  "Switch to Calculator"      -> {"action": "focus_app",    "target": "calculator"}
+  "Close Calculator"          -> {"action": "close_app",    "target": "calculator"}
+  "Which windows are open?"   -> {"action": "list_windows"}
+  "Inspect Calculator"        -> {"action": "inspect_window", "target": "calculator"}
+  "Find buttons in Calculator"-> {"action": "find_control",  "target": "calculator",
+                                  "control_type": "Button"}
+Writing "open", "launch", "switch" or "close" as the action is wrong; write the canonical
+token. "target" is always a registry alias and never a path or a command line.
+
 A conceptual, comparative, or opinion question about Gmail and/or Calendar as products or
 concepts (e.g. "Explain the difference between Gmail and Google Calendar", "Compare email
 and calendar systems", "Can Gmail and Calendar integrate with each other?", "I use Gmail and
@@ -284,9 +297,20 @@ def tool_catalog_section() -> str:
         lines.append(f"- {entry['name']} ({entry['risk_level']}){approval}: {entry['description']}")
         if entry.get("selection_guidance"):
             lines.append(f"    when: {entry['selection_guidance']}")
-        argument_names = sorted(entry["arguments"].get("properties", {}))
+        argument_specs = entry["arguments"].get("properties", {})
+        argument_names = sorted(argument_specs)
         if argument_names:
             lines.append(f"    arguments: {', '.join(argument_names)}")
+        # Publish closed vocabularies in the prompt as well as in the response
+        # schema. Naming an argument without naming its legal values is what let
+        # the model answer "Open Notepad" with action="open" instead of the
+        # canonical "open_app".
+        for name in argument_names:
+            members = _string_enum_members(argument_specs.get(name) or {})
+            if members:
+                lines.append(
+                    f"    {name} must be exactly one of: {', '.join(members)}"
+                )
         required = entry["arguments"].get("required") or []
         if required:
             lines.append(f"    required: {', '.join(sorted(required))}")
@@ -306,6 +330,31 @@ _JSON_SCALARS: Final[Mapping[str, str]] = {
 }
 
 
+#: Upper bound on how many members an argument enum may carry into the provider
+#: schema. A closed vocabulary is a handful of tokens; anything larger is a data
+#: list that does not belong in a response schema.
+_MAX_SCHEMA_ENUM_MEMBERS: Final[int] = 24
+
+
+def _string_enum_members(spec: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """The closed string vocabulary a JSON-schema property declares, if any.
+
+    Only a top-level `enum` of non-empty strings counts. Nested anyOf/nullable
+    forms are deliberately ignored: the point is to publish a constraint we are
+    certain about, and a half-understood one is worse than none.
+    """
+    members = spec.get("enum")
+    if not isinstance(members, (list, tuple)) or not members:
+        return None
+    if len(members) > _MAX_SCHEMA_ENUM_MEMBERS:
+        return None
+    if not all(isinstance(item, str) and item.strip() for item in members):
+        # Gemini rejects an empty-string enum member with HTTP 400, and a
+        # non-string member cannot be expressed in a STRING property.
+        return None
+    return tuple(members)
+
+
 def _argument_property_union() -> dict[str, Any]:
     """Flat union of every capability's argument fields, for the response schema.
 
@@ -314,8 +363,25 @@ def _argument_property_union() -> dict[str, Any]:
     argument names as optional fields. Pydantic then validates the ones that
     matter for the selected tool and discards the rest, so the schema constrains
     shape while tool_requests remains the authority on validity.
+
+    CLOSED VOCABULARIES SURVIVE THE FLATTENING. A field typed as a Literal --
+    DesktopControlRequest.action, for instance -- carries its enum through to
+    the provider. Dropping it was a real defect: with `action` published as a
+    bare STRING, the model answered "Open Notepad" with action="open", which is
+    natural language rather than the canonical `open_app`, and the typed
+    boundary then (correctly) rejected the turn. The schema must state the
+    vocabulary it expects.
+
+    An enum is published only when EVERY capability declaring that argument
+    name agrees on it exactly. Two capabilities sharing a name with different
+    vocabularies would otherwise over-constrain each other, so that case
+    degrades to a plain STRING -- the same conservative direction the type
+    conflict below already takes.
     """
     properties: dict[str, Any] = {}
+    # name -> the agreed enum so far, or None once any declaration disagrees.
+    enums: dict[str, tuple[str, ...] | None] = {}
+
     for entry in _registered_capabilities():
         for name, spec in entry["arguments"].get("properties", {}).items():
             declared = spec.get("type")
@@ -327,6 +393,13 @@ def _argument_property_union() -> dict[str, Any]:
                 # Unions, enums-with-null and anyOf collapse to STRING: the
                 # model still emits a usable value and Pydantic coerces it.
                 kind = "STRING"
+
+            members = _string_enum_members(spec) if kind == "STRING" else None
+            if name not in enums:
+                enums[name] = members
+            elif enums[name] != members:
+                enums[name] = None
+
             existing = properties.get(name)
             if existing is None:
                 properties[name] = (
@@ -336,6 +409,11 @@ def _argument_property_union() -> dict[str, Any]:
                 )
             elif existing.get("type") != kind:
                 properties[name] = {"type": "STRING"}
+                enums[name] = None
+
+    for name, members in enums.items():
+        if members and properties.get(name, {}).get("type") == "STRING":
+            properties[name]["enum"] = list(members)
     return properties
 
 

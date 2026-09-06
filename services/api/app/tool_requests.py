@@ -303,6 +303,63 @@ _DESKTOP_ACTIONS_NEEDING_TARGET: Final[frozenset[str]] = frozenset(
     {"inspect_window", "find_control", "open_app", "focus_app", "close_app"}
 )
 
+# Reviewed, exact synonyms for the canonical desktop actions.
+#
+# WHY THIS EXISTS. The provider response schema now publishes the action enum,
+# so the model should emit `open_app` directly -- that is the primary contract.
+# This map is resilience for provider variation, not permission: live hardware
+# showed Gemini answering "Open Notepad" with action="open" while the schema
+# still flattened the Literal to a bare STRING, and the turn failed closed with
+# "I need a bit more detail before I can do that safely."
+#
+# WHAT IT IS NOT. It is a closed dictionary lookup with no default, applied only
+# once `desktop_control` has ALREADY been selected. It cannot select the
+# capability, cannot reach `target`, and cannot invent an action: an unmapped
+# token passes through untouched and is rejected by the Literal below, failing
+# the turn exactly as before. Every entry is an exact synonym of an action that
+# is already policy-gated downstream -- close_app still refuses File Explorer,
+# safe_shortcut still refuses Ctrl+Alt+Del -- so nothing here widens authority.
+#
+# "run" and "execute" are deliberately ABSENT. "run powershell -Command ..."
+# must not acquire a foothold, however harmless the mapping would look.
+_DESKTOP_ACTION_ALIASES: Final[Mapping[str, str]] = {
+    # open_app: start a registered application
+    "open": "open_app",
+    "launch": "open_app",
+    "start": "open_app",
+    # focus_app: bring an already-running application to the front
+    "focus": "focus_app",
+    "switch": "focus_app",
+    "switch_to": "focus_app",
+    "activate": "focus_app",
+    "bring_to_front": "focus_app",
+    # close_app: graceful WM_CLOSE, still policy-gated per application
+    "close": "close_app",
+    "quit": "close_app",
+    # read-only actions: no state change is possible through any of these
+    "list": "list_windows",
+    "list_apps": "list_windows",
+    "list_applications": "list_windows",
+    "windows": "list_windows",
+    "inspect": "inspect_window",
+    "find": "find_control",
+    "find_controls": "find_control",
+    # safe_shortcut: the shortcut allowlist remains the gate
+    "shortcut": "safe_shortcut",
+    "send_shortcut": "safe_shortcut",
+}
+
+
+def canonical_desktop_action(value: Any) -> str:
+    """Fold a reviewed synonym to its canonical action token.
+
+    Exact match only, after case and separator normalisation. Anything not in
+    the closed map is returned unchanged so the Literal can reject it.
+    """
+    text = " ".join(str(value or "").strip().casefold().split())
+    text = text.replace("-", "_").replace(" ", "_")
+    return _DESKTOP_ACTION_ALIASES.get(text, text)
+
 
 class DesktopControlRequest(ToolRequest):
     """Control the Windows desktop through the bounded Part 12.1 action set.
@@ -322,6 +379,17 @@ class DesktopControlRequest(ToolRequest):
     max_depth: int = Field(default=4, ge=1, le=4)
     max_nodes: int = Field(default=120, ge=1, le=120)
     timeout_seconds: float = Field(default=10.0, ge=1.0, le=30.0)
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _canonical_action(cls, value: Any) -> Any:
+        """Fold a reviewed synonym before the Literal is checked.
+
+        Runs only for this capability, so it can refine an action inside an
+        already-chosen desktop_control turn and can never cause one. An unknown
+        token is passed straight through to fail closed.
+        """
+        return canonical_desktop_action(value) if isinstance(value, str) else value
 
     @field_validator("target")
     @classmethod

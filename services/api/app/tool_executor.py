@@ -214,10 +214,14 @@ def build_capabilities() -> tuple[Capability, ...]:
             audit_policy=AuditPolicy.SANITIZED_ARGUMENTS,
             selection_guidance=(
                 "Only when the user asks Bunnelby to actually DO something to their desktop "
-                "or windows right now. 'target' must be an application alias from the "
-                "registry (notepad, calculator, file_explorer, settings, edge, chrome, "
-                "vscode, terminal) -- never a path or a command line. Conceptual questions "
-                "about Windows, Alt+Tab, or what an app is are ordinary conversation."
+                "or windows right now. 'action' is a canonical token, never a plain verb: "
+                "'Open Notepad' is action=open_app (NOT 'open'), 'Switch to Calculator' is "
+                "action=focus_app, 'Close Calculator' is action=close_app, 'Which windows "
+                "are open?' is action=list_windows. 'target' must be an application alias "
+                "from the registry (notepad, calculator, file_explorer, settings, edge, "
+                "chrome, vscode, terminal) -- never a path or a command line. Conceptual "
+                "questions about Windows, Alt+Tab, or what an app is are ordinary "
+                "conversation."
             ),
             examples=(
                 "Open Notepad.",
