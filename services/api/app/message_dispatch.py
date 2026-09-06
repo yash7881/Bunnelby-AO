@@ -38,7 +38,7 @@ from .gmail_service import (
 )
 from dataclasses import replace
 
-from . import brain_agent
+from . import brain_agent, local_fast_path
 from .orchestrator import OrchestratorResult
 from .tool_requests import build_request
 from .spoken_briefing import (
@@ -231,13 +231,32 @@ def handle_message_result(
     mode=="tool" decision reaches deterministic execution via tool_executor, which in turn
     reuses the existing builder functions below (_gmail_compose_result, _calendar_result,
     _calendar_agenda_result) purely as execution helpers.
+
+    LOCAL FAST PATH. One narrow exception now runs before the Brain: a closed set
+    of literal desktop commands ("Open Notepad") is recognised locally and turned
+    into the SAME canonical BrainDecision the Brain would have produced, saving a
+    cloud round-trip on a purely local operation. It changes only WHO decides, not
+    WHAT happens next -- the decision goes through the identical tool_executor call
+    below, so typed validation, the Capability Registry, risk policy, the desktop
+    controller, the verifier and the audit row all still run.
+
+    This is not the pre-Brain keyword gate that was removed from
+    intelligence_dispatch: that one matched substrings anywhere in a message and
+    could reach external Gmail/Calendar writes. This one fullmatches the whole
+    utterance against a reviewed grammar, resolves its target exactly through
+    app_registry, guards negation, and can reach only four local, reversible,
+    policy-gated desktop actions. See local_fast_path for the full argument.
     """
     # tool_executor imports this module for its execution builders, so that one
     # import stays deferred until Phase G moves the builders out. brain_agent no
     # longer imports the legacy router, so it is a normal module-level import.
     from . import tool_executor
 
-    decision = brain_agent.decide(user_message, session_id=session_id)
+    # Exactly one of these two runs. A local hit never also consults the Brain,
+    # and a miss leaves the Brain path completely unchanged.
+    decision = local_fast_path.try_local_fast_path(user_message)
+    if decision is None:
+        decision = brain_agent.decide(user_message, session_id=session_id)
 
     if decision.mode == "tool":
         return tool_executor.execute(
