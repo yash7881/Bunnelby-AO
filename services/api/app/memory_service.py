@@ -254,8 +254,29 @@ def _turn_relevance(query_terms: set[str], turn: MemoryTurn) -> float:
 
 
 _TOOL_MEMORY_ROUTES: Final[frozenset[str]] = frozenset(
-    {"gmail", "calendar", "cross_tool", "file_search"}
+    {"gmail", "calendar", "cross_tool", "file_search", "desktop_control"}
 )
+
+
+def _base_route(route: str | None) -> str:
+    """The bare route token, without any per-turn detail a route line carries.
+
+    Routes are recorded as free text by each executor, and they are not all
+    shaped alike: gmail writes "Route: gmail", while desktop writes
+    "Route: desktop_control (open_app)". A membership test against the raw
+    value therefore silently misses every desktop turn -- which is exactly how
+    desktop execution history leaked into ordinary conversational memory and
+    biased a self-contained question ("What is Notepad?") into a clarification.
+
+    Normalising to the leading token makes the classification independent of
+    whatever suffix an executor chooses to append, now or later.
+    """
+    return str(route or "").strip().casefold().split("(", 1)[0].strip()
+
+
+def _is_tool_route(route: str | None) -> bool:
+    """True when this turn's reply was produced by a tool, not by conversation."""
+    return _base_route(route) in _TOOL_MEMORY_ROUTES
 
 
 def _format_turns(turns: list[MemoryTurn], *, limit: int = MAX_MESSAGE_CHARS) -> str:
@@ -272,8 +293,11 @@ def _format_turns(turns: list[MemoryTurn], *, limit: int = MAX_MESSAGE_CHARS) ->
     blocks: list[str] = []
     for turn in turns:
         assistant = _clip(turn.assistant, limit)
-        if turn.route in _TOOL_MEMORY_ROUTES:
-            assistant = wrap_tool_summary(turn.route or "tool", assistant).render()
+        if _is_tool_route(turn.route):
+            # Desktop replies carry window titles -- screen text authored by
+            # other programs. Part 12.1 wraps that as untrusted at execution
+            # time; without this it would be replayed here as trusted prose.
+            assistant = wrap_tool_summary(_base_route(turn.route) or "tool", assistant).render()
         blocks.append(f"User: {_clip(turn.user, limit)}\nBunnelby: {assistant}")
     return "\n\n".join(blocks)
 
@@ -308,6 +332,40 @@ _TOOL_MEMORY_CUE_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"schedule|event|availability|file|document|folder|local\s+search)\b",
     re.IGNORECASE,
 )
+
+# A definitional question asks what something IS. It is about the world, not
+# about the user's data, so it must not pull tool history in merely because a
+# cue word appears inside it: "What is File Explorer?" contains "file", and
+# "Explain the difference between Gmail and Calendar" contains both cue sets --
+# the very shape that once made a conceptual question fire real API calls.
+_DEFINITIONAL_QUESTION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^\s*(?:what\s+(?:is|are|was|were|does|do)|what's|whats|"
+    r"explain|describe|define|tell\s+me\s+about|"
+    r"how\s+(?:does|do|did|is|are))\b",
+    re.IGNORECASE,
+)
+
+# "my", "our", "mine" turn a definitional question into a question about the
+# user's own data ("What is my calendar like?"), which legitimately wants tool
+# history.
+_PERSONAL_SCOPE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:my|mine|our|ours|mera|meri|mere)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_self_contained_definitional_question(message: str) -> bool:
+    """True for a question that carries its own subject and asks what it is.
+
+    Requires a real subject term, so a bare pronoun question ("What is it?")
+    is NOT treated as self-contained and keeps its conversational context.
+    """
+    if not _DEFINITIONAL_QUESTION_PATTERN.search(message):
+        return False
+    if _PERSONAL_SCOPE_PATTERN.search(message):
+        return False
+    # _terms() drops stopwords, so "what is it" yields nothing to define.
+    return bool(_terms(message))
 
 
 
@@ -348,7 +406,7 @@ def build_memory_context(
     )
     explicit_tool_context = bool(
         _TOOL_MEMORY_CUE_PATTERN.search(current_user_message)
-    )
+    ) and not _is_self_contained_definitional_question(current_user_message)
 
     # Tool history is useful when explicitly requested, during temporal recall,
     # or for a direct follow-up. It is harmful noise for unrelated casual chat.
@@ -361,11 +419,7 @@ def build_memory_context(
     if allow_tool_memory:
         eligible_turns = all_turns
     else:
-        eligible_turns = [
-            turn
-            for turn in all_turns
-            if turn.route not in _TOOL_MEMORY_ROUTES
-        ]
+        eligible_turns = [turn for turn in all_turns if not _is_tool_route(turn.route)]
 
     # Standalone conversational turns need a small working-memory window.
     # Direct follow-ups are allowed a wider window to preserve continuity.

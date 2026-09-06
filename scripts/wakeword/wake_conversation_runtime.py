@@ -13,6 +13,7 @@ import unicodedata
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import sherpa_onnx
@@ -51,6 +52,9 @@ from services.api.app.tts_service import (
 )
 from services.api.app.voice_session import (
     DEFAULT_FOLLOW_UP_SECONDS,
+    ConversationPhase,
+    VoiceActivationDenied,
+    VoiceConversationAuthority,
     VoiceSessionController,
     VoiceState,
     VoiceTransition,
@@ -444,8 +448,17 @@ def capture_conversation_turn(
     wait_seconds: float,
     initial_samples: np.ndarray | None = None,
     initial_speech_started_at: float | None = None,
+    speech_gate: ExternalPlaybackGate | None = None,
 ) -> CapturedUtterance | None:
-    """Capture one utterance in RAM; the timeout applies only to speech onset."""
+    """Capture one utterance in RAM; the timeout applies only to speech onset.
+
+    Called only while a conversation lease is live, never in wake-only standby.
+
+    `speech_gate` suppresses SPEECH ONSET while the renderer is talking. Without
+    it a follow-up capture can hear Bunnelby's own playback (or its room echo)
+    and treat it as the user's next command. Frames are still read and fed to
+    the VAD so the stream never backs up; only the onset decision is withheld.
+    """
     vad, window_size = create_conversation_vad(
         model_path,
         min_silence_seconds=args.conversation_silence,
@@ -472,6 +485,13 @@ def capture_conversation_turn(
         now = time.monotonic()
 
         if speech_started_at is None and vad.is_speech_detected():
+            if speech_gate is not None and speech_gate.is_blocked():
+                # Assistant playback (or its tail) is on the speakers. This is
+                # Bunnelby hearing itself, not the user starting a turn.
+                waiting_started = now
+                vad.flush()
+                _pop_segments(vad)
+                continue
             speech_started_at = now
             print("Speech detected - keep talking naturally...")
 
@@ -1125,6 +1145,16 @@ def run(args: argparse.Namespace) -> int:
     renderer_speech_gate = ExternalPlaybackGate(args.renderer_speaker_tail)
     if args.voice_control_stdin:
         _start_voice_control_listener(sys.stdin, renderer_speech_gate)
+    # The microphone stream and the wake detector are live for the whole run.
+    # This governs only whether heard speech may become a COMMAND: in
+    # STANDBY_WAKE nothing but the wake detector can start a turn, so the user
+    # can launch Bunnelby and speak the wake phrase immediately, with no
+    # enable step of any kind.
+    conversation = VoiceConversationAuthority()
+    print(
+        f"[voice] conversation_phase={conversation.phase.value} "
+        "wake_monitor=live mic_stream=live"
+    )
 
     def accept_barge_in(speech_started_at: float) -> None:
         """Move SPEAKING -> LISTENING the moment cancellation is requested."""
@@ -1206,6 +1236,19 @@ def run(args: argparse.Namespace) -> int:
                         continue
                     print()
                     print(f"WAKE DETECTED: {wake_text!r} ({wake_latency:.2f}s ASR)")
+                    # STANDBY_WAKE -> ACTIVE_TURN. This is the ONLY transition
+                    # out of wake-only standby: the wake phrase is the user's
+                    # consent, so it is always honoured. The single refusal is a
+                    # duplicate delivery of one physical activation.
+                    try:
+                        activation = conversation.begin_wake_turn()
+                    except VoiceActivationDenied as denial:
+                        print(f"[voice] voice_activation rejected reason={denial.reason}")
+                        continue
+                    print(
+                        f"[voice] voice_activation accepted activation_id={activation.activation_id} "
+                        f"source=wake phase={conversation.phase.value}"
+                    )
                     _emit_ui_event(
                         "wake_detected",
                         transcript=wake_text,
@@ -1224,6 +1267,7 @@ def run(args: argparse.Namespace) -> int:
                         model_path,
                         args,
                         wait_seconds=args.command_wait,
+                        speech_gate=renderer_speech_gate,
                     )
                     if next_audio is None:
                         stats.empty_turns += 1
@@ -1238,6 +1282,25 @@ def run(args: argparse.Namespace) -> int:
                         continue
 
                 if controller.state is VoiceState.FOLLOW_UP:
+                    # A follow-up listens WITHOUT a wake phrase, so it is the
+                    # one place the system could start a turn the user never
+                    # asked for. Permission is re-checked every time rather
+                    # than inherited from the original activation.
+                    if not conversation.may_begin_follow_up():
+                        print(
+                            "[voice] follow_up skipped "
+                            f"phase={conversation.phase.value} "
+                            f"count={conversation.consecutive_follow_ups}"
+                            f"/{conversation.max_consecutive_follow_ups}"
+                        )
+                        controller.expire_follow_up(at=controller.follow_up_deadline)
+                        conversation.return_to_standby("follow-up chain limit")
+                        _emit_ui_event(
+                            "state", state="standby", reason="follow-up chain limit"
+                        )
+                        pending_wake_latency_ms = None
+                        next_audio = None
+                        continue
                     remaining = controller.follow_up_remaining()
                     print(f"Follow-up listening: {remaining:.1f}s; wake phrase not required")
                     next_audio = capture_conversation_turn(
@@ -1245,10 +1308,19 @@ def run(args: argparse.Namespace) -> int:
                         model_path,
                         args,
                         wait_seconds=remaining,
+                        # Self-audio protection: the assistant's own playback
+                        # (and its tail) must never be heard as the user's next
+                        # command. This gate already existed for wake and was
+                        # simply never applied to the follow-up capture.
+                        speech_gate=renderer_speech_gate,
                     )
                     if next_audio is None:
                         stats.follow_up_timeouts += 1
                         controller.expire_follow_up(at=time.monotonic())
+                        # PERMISSION expires here, nothing else: the microphone
+                        # stream and the wake detector stay live, and the wake
+                        # phrase is required for the next turn.
+                        conversation.return_to_standby("follow-up window expired")
                         print("Follow-up window expired.")
                         print(
                             "State: STANDBY - next interaction requires "
@@ -1266,10 +1338,40 @@ def run(args: argparse.Namespace) -> int:
                         next_audio = None
                         pending_wake_latency_ms = None
                         continue
+                    try:
+                        activation = conversation.begin_follow_up_turn(
+                            playback_blocked=renderer_speech_gate.is_blocked()
+                        )
+                    except VoiceActivationDenied as denial:
+                        print(f"[voice] follow_up rejected reason={denial.reason}")
+                        controller.transition(
+                            VoiceState.STANDBY, "follow-up refused by authority"
+                        )
+                        conversation.return_to_standby(denial.reason)
+                        next_audio = None
+                        pending_wake_latency_ms = None
+                        continue
                     print("Follow-up accepted without wake phrase.")
+                    print(
+                        f"[voice] follow_up accepted count={conversation.consecutive_follow_ups}"
+                        f"/{conversation.max_consecutive_follow_ups} "
+                        f"activation_id={activation.activation_id}"
+                    )
                     pending_wake_latency_ms = None
 
                 if controller.state is not VoiceState.LISTENING or next_audio is None:
+                    continue
+
+                # THE CORE INVARIANT. Captured audio becomes a command only
+                # while a live conversation lease exists. In wake-only standby
+                # this is False, so ambient speech can never reach STT or /chat.
+                if not conversation.may_capture_command():
+                    print(
+                        "[voice] command discarded reason=no_active_lease "
+                        f"phase={conversation.phase.value}"
+                    )
+                    next_audio = None
+                    _standby_after_failure(controller, "no active conversation lease")
                     continue
 
                 stats.microphone_overflows += next_audio.overflows
@@ -1330,9 +1432,19 @@ def run(args: argparse.Namespace) -> int:
                 if not args.dispatch:
                     controller.response_completed_without_tts()
                     controller.expire_follow_up(at=controller.follow_up_deadline)
+                    conversation.return_to_standby("diagnostic transcription-only turn")
                     metrics.turn_total_ms = (time.monotonic() - turn_started_at) * 1000.0
                     _emit_metrics(metrics)
                     print("Diagnostic transcription-only turn complete; returning to STANDBY.")
+                    continue
+
+                # Last checkpoint before the turn leaves this process.
+                if not conversation.may_capture_command():
+                    print(
+                        "[voice] chat_dispatch cancelled reason=no_active_lease "
+                        f"turn={voice_turn_seq}"
+                    )
+                    _standby_after_failure(controller, "no active conversation lease")
                     continue
 
                 print(
@@ -1383,6 +1495,7 @@ def run(args: argparse.Namespace) -> int:
                 if not args.tts or not spoken:
                     transition = controller.response_completed_without_tts(at=time.monotonic())
                     _state(controller, transition)
+                    conversation.open_follow_up_window()
                     print("TTS disabled/empty; follow-up timer uses response completion fallback.")
                 else:
                     tts_started_at = time.monotonic()
@@ -1405,6 +1518,7 @@ def run(args: argparse.Namespace) -> int:
                     except (RuntimeError, AudioPlaybackError) as exc:
                         stats.tts_failures += 1
                         _state(controller, controller.playback_failed(at=time.monotonic()))
+                        conversation.open_follow_up_window()
                         print(f"TTS failed safely; screen reply remains available: {exc}")
                     else:
                         start_status = _await_playback_start(handle)
@@ -1431,6 +1545,7 @@ def run(args: argparse.Namespace) -> int:
                                         controller,
                                         controller.playback_failed(at=failure_at),
                                     )
+                                    conversation.open_follow_up_window()
                                 print(
                                     "Playback monitoring failed safely; screen reply remains "
                                     f"available: {exc}"
@@ -1494,6 +1609,7 @@ def run(args: argparse.Namespace) -> int:
                                     controller,
                                     controller.playback_completed(at=playback.finished_at),
                                 )
+                                conversation.open_follow_up_window()
                                 print("TTS playback completed; fresh follow-up window started.")
                             else:
                                 stats.playback_failures += 1
@@ -1501,6 +1617,7 @@ def run(args: argparse.Namespace) -> int:
                                     controller,
                                     controller.playback_failed(at=playback.finished_at),
                                 )
+                                conversation.open_follow_up_window()
                                 print(
                                     "Playback failed safely; screen reply remains available: "
                                     f"{playback.error or playback.status.value}"
@@ -1511,6 +1628,7 @@ def run(args: argparse.Namespace) -> int:
                             stats.playback_failures += 1
                             failure_at = playback.finished_at if playback else time.monotonic()
                             _state(controller, controller.playback_failed(at=failure_at))
+                            conversation.open_follow_up_window()
                             print("TTS playback could not start; follow-up fallback timer started.")
 
                 metrics.turn_total_ms = (time.monotonic() - turn_started_at) * 1000.0
