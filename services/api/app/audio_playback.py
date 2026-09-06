@@ -288,14 +288,41 @@ class SoundDeviceWavPlayer:
         self.clock = clock
         self.stream_factory = stream_factory
         self.microphone_reference_rate = microphone_reference_rate
+        # Single-owner playback. Each start() previously launched an
+        # independent thread and OutputStream with no reference to the one
+        # already running, so two assistant turns could open two output
+        # streams on the same device and speak over each other. The player is
+        # the only component that can see both, so ownership belongs here.
+        self._active_lock = threading.Lock()
+        self._active: PlaybackHandle | None = None
+
+    def stop_active(self, *, timeout: float = 2.0) -> None:
+        """Cancel and reap whatever this player is currently speaking.
+
+        Reaping matters as much as cancelling: cancel() only sets a flag, so
+        returning before the playback thread has actually released the device
+        would still allow two streams to be open at once.
+        """
+        with self._active_lock:
+            previous = self._active
+            self._active = None
+        if previous is None:
+            return
+        previous.cancel()
+        previous.wait(timeout)
 
     def start(self, wav_bytes: bytes) -> PlaybackHandle:
+        # Decode BEFORE cancelling: a malformed payload must raise without
+        # having silenced audio that is legitimately still playing.
         decoded = decode_pcm_wav(wav_bytes)
+        self.stop_active()
         handle = PlaybackHandle(
             decoded,
             clock=self.clock,
             microphone_reference_rate=self.microphone_reference_rate,
         )
+        with self._active_lock:
+            self._active = handle
         handle._launch(self._play)
         return handle
 

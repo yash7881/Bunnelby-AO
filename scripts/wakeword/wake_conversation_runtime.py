@@ -1173,6 +1173,10 @@ def run(args: argparse.Namespace) -> int:
 
     next_audio: CapturedUtterance | None = None
     pending_wake_latency_ms: float | None = None
+    # Correlation id carried through transcript -> dispatch -> chat -> tts ->
+    # playback, so a second assistant answer can be attributed to its real
+    # origin from the log instead of guessed at.
+    voice_turn_seq = 0
     exit_code = 0
 
     try:
@@ -1270,6 +1274,7 @@ def run(args: argparse.Namespace) -> int:
 
                 stats.microphone_overflows += next_audio.overflows
                 turn_started_at = next_audio.speech_started_at
+                voice_turn_seq += 1
                 metrics = TurnMetrics(
                     turn=stats.conversation_turns + 1,
                     wake_asr_ms=pending_wake_latency_ms,
@@ -1298,6 +1303,13 @@ def run(args: argparse.Namespace) -> int:
 
                 stats.conversation_turns += 1
                 metrics.turn = stats.conversation_turns
+                # Correlation: one line per finalized utterance. Transcript text
+                # is NOT logged here (it is printed separately below under the
+                # existing transcript banner); this line is identity only.
+                print(
+                    f"[voice] turn={voice_turn_seq} transcript_final "
+                    f"source=persistent_runtime chars={len(transcript)}"
+                )
                 print()
                 print("BUNNELBY CONVERSATION TRANSCRIPT")
                 print(f"Text: {transcript}")
@@ -1323,8 +1335,13 @@ def run(args: argparse.Namespace) -> int:
                     print("Diagnostic transcription-only turn complete; returning to STANDBY.")
                     continue
 
+                print(
+                    f"[voice] turn={voice_turn_seq} dispatch_begin "
+                    "source=persistent_runtime"
+                )
                 try:
                     dispatch_started = time.perf_counter()
+                    print(f"[api]   turn={voice_turn_seq} chat_begin")
                     response = dispatch_to_chat(
                         args.api_url,
                         transcript,
@@ -1332,6 +1349,10 @@ def run(args: argparse.Namespace) -> int:
                         session_id=conversation_session_id,
                     )
                     dispatch_seconds = time.perf_counter() - dispatch_started
+                    print(
+                        f"[api]   turn={voice_turn_seq} chat_end "
+                        f"latency_ms={dispatch_seconds * 1000:.0f}"
+                    )
                     metrics.backend_ms = dispatch_seconds * 1000.0
                     _print_backend_latency(response, dispatch_seconds)
                 except RuntimeError as exc:
@@ -1365,6 +1386,7 @@ def run(args: argparse.Namespace) -> int:
                     print("TTS disabled/empty; follow-up timer uses response completion fallback.")
                 else:
                     tts_started_at = time.monotonic()
+                    print(f"[tts]   turn={voice_turn_seq} tts_request_begin")
                     try:
                         wav_bytes = request_tts(
                             args.tts_url,
@@ -1373,7 +1395,13 @@ def run(args: argparse.Namespace) -> int:
                             args.tts_timeout,
                         )
                         metrics.tts_prepare_ms = (time.monotonic() - tts_started_at) * 1000.0
+                        # start() is now single-owner: it cancels and reaps any
+                        # playback still running before opening a new stream.
                         handle = player.start(wav_bytes)
+                        print(
+                            f"[tts]   turn={voice_turn_seq} playback_begin "
+                            "owner=persistent_runtime"
+                        )
                     except (RuntimeError, AudioPlaybackError) as exc:
                         stats.tts_failures += 1
                         _state(controller, controller.playback_failed(at=time.monotonic()))
@@ -1431,6 +1459,10 @@ def run(args: argparse.Namespace) -> int:
                                     f"(onset to cancel {barge_outcome.detection_latency_ms:.0f} ms, "
                                     f"self-echo coupling {barge_outcome.coupling:.2f})"
                                 )
+                                print(
+                                    f"[tts]   turn={voice_turn_seq} playback_cancel "
+                                    "owner=persistent_runtime reason=barge_in"
+                                )
                                 next_audio = barge_outcome.utterance
                                 if next_audio is None:
                                     controller.transition(
@@ -1454,6 +1486,10 @@ def run(args: argparse.Namespace) -> int:
                                     f"SPEAKING ({playback.status.value})."
                                 )
                             elif playback.status is PlaybackStatus.COMPLETED:
+                                print(
+                                    f"[tts]   turn={voice_turn_seq} playback_end "
+                                    "owner=persistent_runtime"
+                                )
                                 _state(
                                     controller,
                                     controller.playback_completed(at=playback.finished_at),
