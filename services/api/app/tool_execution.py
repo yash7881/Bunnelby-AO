@@ -24,6 +24,7 @@ from .tool_requests import (
     GmailReadRequest,
     GmailReplyRequest,
     FileSearchRequest,
+    DesktopControlRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -666,3 +667,66 @@ __all__ = [
     "execute_gmail_reply",
     "execute_file_search",
 ]
+
+
+
+# --------------------------------------------------------------------------- #
+# Part 12.1: bounded Windows desktop control
+# --------------------------------------------------------------------------- #
+
+
+def execute_desktop_control(request: DesktopControlRequest) -> OrchestratorResult:
+    """Run one bounded desktop action and report exactly what was verified.
+
+    Dispatch is a closed match on the action enum, so an action the controller
+    does not implement cannot fall through to something else. Rendering is
+    delegated to desktop.presentation, which is where the rule "a non-success
+    outcome never renders as a success sentence" is enforced.
+    """
+    from .desktop import DesktopAction
+    from .desktop.controller import default_controller
+    from .desktop.presentation import (
+        UNTRUSTED_NOTE,
+        screen_reply,
+        spoken_reply,
+        untrusted_block,
+    )
+
+    controller = default_controller()
+    action = DesktopAction(request.action)
+
+    if action is DesktopAction.LIST_WINDOWS:
+        outcome = controller.list_windows()
+    elif action is DesktopAction.INSPECT_WINDOW:
+        outcome = controller.inspect_window(
+            request.target, max_depth=request.max_depth, max_nodes=request.max_nodes
+        )
+    elif action is DesktopAction.FIND_CONTROL:
+        outcome = controller.find_control(
+            request.target,
+            name_contains=request.control_name,
+            control_type=request.control_type,
+        )
+    elif action is DesktopAction.OPEN_APP:
+        outcome = controller.open_app(request.target, timeout=request.timeout_seconds)
+    elif action is DesktopAction.FOCUS_APP:
+        outcome = controller.focus_app(request.target, timeout=request.timeout_seconds)
+    elif action is DesktopAction.CLOSE_APP:
+        outcome = controller.close_app(request.target, timeout=request.timeout_seconds)
+    else:
+        outcome = controller.safe_shortcut(request.shortcut)
+
+    reply = screen_reply(outcome)
+    memory = reply + "\nRoute: desktop_control (" + outcome.action.value + ")"
+
+    envelope = untrusted_block(outcome)
+    if envelope:
+        memory = memory + chr(10) + chr(10) + UNTRUSTED_NOTE + chr(10) + envelope
+
+    return OrchestratorResult(
+        reply=reply,
+        action_type="desktop_control",
+        memory_content=memory,
+        spoken_reply=spoken_reply(outcome),
+        spoken_metadata=outcome.audit_payload(),
+    )

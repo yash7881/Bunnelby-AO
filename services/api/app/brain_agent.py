@@ -36,6 +36,7 @@ BrainTool = Literal[
     "calendar_create",
     "cross_tool_read",
     "file_search",
+    "desktop_control",
 ]
 
 # Writes must fail closed to clarification on low confidence or missing arguments.
@@ -50,6 +51,7 @@ _ALLOWED_TOOLS: Final[frozenset[str]] = frozenset(
         "calendar_create",
         "cross_tool_read",
         "file_search",
+        "desktop_control",
     }
 )
 _REQUIRED_ARGS_FOR_TOOL: Final[Mapping[str, tuple[str, ...]]] = {
@@ -129,6 +131,17 @@ their real Gmail or Calendar:
 - file_search: the user explicitly wants to find/search their actual local files, filenames,
   paths, metadata, or indexed document content. Conceptual questions about file search,
   SQLite FTS5, lexical search, or vector search are ordinary conversation, never this tool.
+- desktop_control: the user explicitly wants Bunnelby to ACT on their Windows desktop right
+  now -- open, focus/switch to, or close a registered application, list the open windows, or
+  inspect a window's UI elements. 'target' is an application alias from the registry
+  (notepad, calculator, file_explorer, settings, edge, chrome, vscode, terminal); it is NEVER
+  a file path, an executable path, or a command line, and a request naming one must be
+  refused rather than translated. Questions ABOUT Windows, about what an application is, or
+  about how Alt+Tab works are ordinary conversation, never this tool.
+
+"What is Notepad?", "How does window switching work?", "Can Bunnelby open apps?" and
+"Explain Alt+Tab" are explanations, not desktop actions: answer them conversationally. The
+mere appearance of an application name is never enough to select desktop_control.
 
 A conceptual, comparative, or opinion question about Gmail and/or Calendar as products or
 concepts (e.g. "Explain the difference between Gmail and Google Calendar", "Compare email
@@ -191,7 +204,7 @@ confident about. Reads (gmail_read, calendar_read) can tolerate more phrasing sl
 Return ONE valid JSON object with exactly these fields, and nothing else:
 {
   "mode": "answer" | "clarify" | "tool",
-  "tool": null | "gmail_read" | "gmail_compose" | "gmail_reply" | "calendar_read" | "calendar_create" | "cross_tool_read" | "file_search",
+  "tool": null | "gmail_read" | "gmail_compose" | "gmail_reply" | "calendar_read" | "calendar_create" | "cross_tool_read" | "file_search" | "desktop_control",
   "confidence": 0.0-1.0,
   "arguments": {"recipient_hint": "...", "subject_hint": "...", "body_hint": "...",
                 "title": "...", "start_hint": "...", "end_hint": "...",

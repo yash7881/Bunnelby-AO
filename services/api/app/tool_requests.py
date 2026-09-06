@@ -7,7 +7,14 @@ import re
 from datetime import datetime
 from typing import Any, Final, Literal, Mapping, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 # Part 10.2 Phase F: typed tool requests.
 #
@@ -39,6 +46,15 @@ CalendarReadMode = Literal["agenda", "free_busy", "open_slots"]
 FreshnessPolicy = Literal["cached_ok", "fresh_required"]
 CrossToolSource = Literal["gmail", "calendar"]
 FileSearchMode = Literal["filename", "content", "hybrid"]
+DesktopActionName = Literal[
+    "list_windows",
+    "inspect_window",
+    "find_control",
+    "open_app",
+    "focus_app",
+    "close_app",
+    "safe_shortcut",
+]
 
 
 class ToolRequest(BaseModel):
@@ -283,6 +299,101 @@ class FileSearchRequest(ToolRequest):
         return payload
 
 
+_DESKTOP_ACTIONS_NEEDING_TARGET: Final[frozenset[str]] = frozenset(
+    {"inspect_window", "find_control", "open_app", "focus_app", "close_app"}
+)
+
+
+class DesktopControlRequest(ToolRequest):
+    """Control the Windows desktop through the bounded Part 12.1 action set.
+
+    `target` is an application ALIAS resolved against the deterministic
+    registry -- never a path, never a command line. That is the whole reason
+    this capability cannot become arbitrary code execution, so the validator
+    below rejects anything path-shaped or shell-shaped before resolution is
+    even attempted. `shortcut` is likewise an allowlisted id, not keystrokes.
+    """
+
+    action: DesktopActionName
+    target: str = Field(default="", max_length=48)
+    shortcut: str = Field(default="", max_length=48)
+    control_name: str = Field(default="", max_length=120)
+    control_type: str = Field(default="", max_length=40)
+    max_depth: int = Field(default=4, ge=1, le=4)
+    max_nodes: int = Field(default=120, ge=1, le=120)
+    timeout_seconds: float = Field(default=10.0, ge=1.0, le=30.0)
+
+    @field_validator("target")
+    @classmethod
+    def _alias_only(cls, value: str) -> str:
+        """An application alias, never a path or a command.
+
+        Mirrors FileSearchRequest.root_scope: the model may name a thing, it may
+        never name a location or an executable.
+        """
+        text = " ".join(str(value or "").strip().casefold().split())
+        if not text:
+            return ""
+        # Each token must START with a letter/digit, so switch-shaped input
+        # ("powershell -Command ...", "app /quiet") cannot masquerade as an
+        # alias even though its characters are individually harmless.
+        if not re.fullmatch(r"[a-z][a-z0-9]*(?:[ _-][a-z0-9]+)*", text):
+            raise ValueError(
+                "target must be an application alias, never a path or command line"
+            )
+        return text
+
+    @field_validator("shortcut")
+    @classmethod
+    def _shortcut_id_only(cls, value: str) -> str:
+        text = str(value or "").strip().casefold().replace(" ", "_").replace("+", "_")
+        if not text:
+            return ""
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", text):
+            raise ValueError("shortcut must be an allowlisted shortcut id")
+        return text
+
+    @field_validator("control_type")
+    @classmethod
+    def _control_type_token(cls, value: str) -> str:
+        text = str(value or "").strip()
+        if text and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,39}", text):
+            raise ValueError("control_type must be a UI Automation control-type name")
+        return text
+
+    @model_validator(mode="after")
+    def _action_needs_its_target(self) -> "DesktopControlRequest":
+        """A target-requiring action must actually carry a target.
+
+        This is what makes a rejected target fail the TURN rather than quietly
+        default to empty. build_request drops an invalid OPTIONAL field and
+        retries, so without this check "open C:/Windows/System32/cmd.exe" would
+        become a targetless open_app instead of a refusal. A model-level error
+        has no single offending field name, so build_request treats it as
+        blocking -- which is exactly the intent.
+        """
+        if self.action in _DESKTOP_ACTIONS_NEEDING_TARGET and not self.target:
+            raise ValueError(
+                f"action {self.action!r} requires a registered application alias "
+                "as 'target' (paths and command lines are never accepted)"
+            )
+        if self.action == "safe_shortcut" and not self.shortcut:
+            raise ValueError("action 'safe_shortcut' requires an allowlisted shortcut id")
+        return self
+
+    @property
+    def tool_name(self) -> str:
+        return "desktop_control"
+
+    def audit_arguments(self) -> dict[str, Any]:
+        payload = super().audit_arguments()
+        # A control name is user/UI text; record its shape, not its content.
+        name = payload.pop("control_name", "")
+        if name:
+            payload["control_name_chars"] = len(str(name))
+        return payload
+
+
 REQUEST_MODELS: Final[Mapping[str, type[ToolRequest]]] = {
     "general_answer": GeneralAnswerRequest,
     "gmail_read": GmailReadRequest,
@@ -292,6 +403,7 @@ REQUEST_MODELS: Final[Mapping[str, type[ToolRequest]]] = {
     "calendar_create": CalendarCreateRequest,
     "cross_tool_read": CrossToolReadRequest,
     "file_search": FileSearchRequest,
+    "desktop_control": DesktopControlRequest,
 }
 
 # Requests that can produce an external side effect (always via an approval).
@@ -301,6 +413,9 @@ WRITE_REQUEST_NAMES: Final[frozenset[str]] = frozenset(
 READ_REQUEST_NAMES: Final[frozenset[str]] = frozenset(
     {"gmail_read", "calendar_read", "cross_tool_read", "file_search"}
 )
+# Part 12.1: desktop_control spans observe and local-modify actions, so it is
+# neither a pure read nor an external write. Its per-action risk is decided by
+# the controller and the application registry, not by membership here.
 
 
 class ToolRequestValidationError(ValueError):

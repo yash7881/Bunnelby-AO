@@ -219,12 +219,82 @@ def verify_file_search(request: FileSearchRequest, result: Any) -> VerificationR
     )
 
 
+def verify_desktop_control(request: Any, result: Any) -> VerificationResult:
+    """Confirm a desktop action against the state the controller OBSERVED.
+
+    The controller already performs the read-back (poll for the window, ask the
+    OS what is foreground). This verifier's job is to make sure that observation
+    reaches the ledger with the right verdict, and -- critically -- that an
+    `unverified` controller outcome can never be reported as verified.
+
+    Mapping:
+      succeeded            -> verified
+      unverified           -> uncertain   ("did it, cannot prove the end state")
+      needs_clarification  -> uncertain   (a confirmation dialog is open)
+      failed / blocked     -> failed
+    """
+    action = getattr(getattr(result, "action", None), "value", "unknown")
+    status = getattr(result, "status", "failed")
+    expected = {
+        "action": getattr(request, "action", action),
+        "target": getattr(request, "target", "") or getattr(result, "target", ""),
+    }
+    observed = {
+        "status": status,
+        "window_count": len(getattr(result, "windows", ()) or ()),
+        **{str(key): value for key, value in dict(getattr(result, "evidence", {}) or {}).items()},
+    }
+    if status == "succeeded":
+        verdict: Verdict = "verified"
+    elif status in ("unverified", "needs_clarification"):
+        verdict = "uncertain"
+    else:
+        verdict = "failed"
+
+    evidence = str(getattr(result, "detail", ""))[:MAX_EVIDENCE_CHARS]
+    return VerificationResult(
+        verifier_name="desktop_control",
+        verdict=verdict,
+        expected=expected,
+        observed=observed,
+        evidence_text=evidence,
+    )
+
+
 READ_VERIFIERS: Final[Mapping[str, Any]] = {
     "gmail_read": verify_gmail_read,
     "calendar_read": verify_calendar_read,
     "cross_tool_read": verify_cross_tool_read,
     "file_search": verify_file_search,
 }
+
+
+#: Verifiers for capabilities that CHANGE state and confirm their own end
+#: state inline (Part 12.1 desktop control). Kept separate from READ_VERIFIERS
+#: because that registry is contractually exactly the L0_OBSERVE capabilities.
+STATE_VERIFIERS: Final[Mapping[str, Any]] = {
+    "desktop_control": verify_desktop_control,
+}
+
+
+def verify_capability(request: ToolRequest, result: Any) -> VerificationResult | None:
+    """Run whichever verifier owns this capability, read or state-changing."""
+    verifier = READ_VERIFIERS.get(request.tool_name) or STATE_VERIFIERS.get(
+        request.tool_name
+    )
+    if verifier is None:
+        return None
+    try:
+        return verifier(request, result)
+    except Exception as exc:  # noqa: BLE001 - a broken verifier must not pass
+        logger.warning("Verifier for %s raised: %s", request.tool_name, exc, exc_info=True)
+        return VerificationResult(
+            f"{request.tool_name}_verifier",
+            "uncertain",
+            {},
+            {},
+            f"verifier raised {type(exc).__name__}",
+        )
 
 
 def verify_read(request: ToolRequest, result: Any) -> VerificationResult | None:
@@ -507,6 +577,9 @@ def uncertainty_message(result: VerificationResult | None) -> str | None:
 
 __all__ = [
     "READ_VERIFIERS",
+    "STATE_VERIFIERS",
+    "verify_capability",
+    "verify_desktop_control",
     "WRITE_VERIFIERS",
     "VerificationResult",
     "Verdict",

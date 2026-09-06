@@ -133,6 +133,8 @@ class RegisteredCapabilityPolicyTests(unittest.TestCase):
         "calendar_read": (RiskLevel.L0_OBSERVE, False),
         "cross_tool_read": (RiskLevel.L0_OBSERVE, False),
         "file_search": (RiskLevel.L0_OBSERVE, False),
+        # Part 12.1: graceful, local, reversible desktop control.
+        "desktop_control": (RiskLevel.L2_MODIFY_LOCAL, False),
         "gmail_compose": (RiskLevel.L3_EXTERNAL_WRITE, True),
         "gmail_reply": (RiskLevel.L3_EXTERNAL_WRITE, True),
         "calendar_create": (RiskLevel.L3_EXTERNAL_WRITE, True),
