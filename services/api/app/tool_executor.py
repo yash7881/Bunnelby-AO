@@ -27,6 +27,7 @@ from .tool_requests import (
     GmailReadRequest,
     GmailReplyRequest,
     FileSearchRequest,
+    DesktopControlRequest,
     ToolRequest,
     ToolRequestValidationError,
     build_request,
@@ -191,6 +192,39 @@ def build_capabilities() -> tuple[Capability, ...]:
                 "real calendar checked in the same turn."
             ),
             examples=("Check my latest emails and what's on my calendar tomorrow.",),
+        ),
+        Capability(
+            name="desktop_control",
+            version="1.0",
+            description=(
+                "Control the Windows desktop within a bounded action set: list windows, "
+                "inspect a window's UI elements, open/focus/close a REGISTERED application, "
+                "or send an allowlisted keyboard shortcut."
+            ),
+            request_model=DesktopControlRequest,
+            # The most dangerous action this capability permits is a graceful
+            # close of a registered app: local, reversible by reopening, and
+            # never forced. That is L2, not an external write, so it is audited
+            # and verified but does not demand an approval card for every
+            # "close Calculator".
+            risk_level=RiskLevel.L2_MODIFY_LOCAL,
+            approval_policy=ApprovalPolicy.NEVER,
+            executor=_late("execute_desktop_control"),
+            freshness_policy=FreshnessPolicy.FRESH_REQUIRED,
+            audit_policy=AuditPolicy.SANITIZED_ARGUMENTS,
+            selection_guidance=(
+                "Only when the user asks Bunnelby to actually DO something to their desktop "
+                "or windows right now. 'target' must be an application alias from the "
+                "registry (notepad, calculator, file_explorer, settings, edge, chrome, "
+                "vscode, terminal) -- never a path or a command line. Conceptual questions "
+                "about Windows, Alt+Tab, or what an app is are ordinary conversation."
+            ),
+            examples=(
+                "Open Notepad.",
+                "Switch to Calculator.",
+                "Close Calculator.",
+                "Which windows are open?",
+            ),
         ),
         Capability(
             name="file_search",
@@ -402,7 +436,7 @@ def execute(
         # now. Write capabilities are only PROPOSED here, so their external
         # verifier runs after approval execution instead.
         if error_code is None and not risk.requires_approval:
-            verdict = verification_service.verify_read(request, result)
+            verdict = verification_service.verify_capability(request, result)
             if verdict is not None:
                 audit_service.record_verification(
                     verifier_name=verdict.verifier_name,
