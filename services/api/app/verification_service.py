@@ -219,6 +219,19 @@ def verify_file_search(request: FileSearchRequest, result: Any) -> VerificationR
     )
 
 
+#: Controller status -> ledger verdict. `unverified` and `needs_clarification`
+#: are uncertain rather than failed: the action was attempted and the end state
+#: could not be proven, which is neither a success nor a clean failure. A status
+#: absent from this map is never treated as success.
+_DESKTOP_STATUS_VERDICTS: Final[Mapping[str, Verdict]] = {
+    "succeeded": "verified",
+    "unverified": "uncertain",
+    "needs_clarification": "uncertain",
+    "failed": "failed",
+    "blocked": "failed",
+}
+
+
 def verify_desktop_control(request: Any, result: Any) -> VerificationResult:
     """Confirm a desktop action against the state the controller OBSERVED.
 
@@ -233,28 +246,84 @@ def verify_desktop_control(request: Any, result: Any) -> VerificationResult:
       needs_clarification  -> uncertain   (a confirmation dialog is open)
       failed / blocked     -> failed
     """
-    action = getattr(getattr(result, "action", None), "value", "unknown")
-    status = getattr(result, "status", "failed")
+    requested_action = str(getattr(request, "action", "") or "")
     expected = {
-        "action": getattr(request, "action", action),
-        "target": getattr(request, "target", "") or getattr(result, "target", ""),
+        "action": requested_action,
+        "target": str(getattr(request, "target", "") or ""),
     }
-    observed = {
-        "status": status,
-        "window_count": len(getattr(result, "windows", ()) or ()),
-        **{str(key): value for key, value in dict(getattr(result, "evidence", {}) or {}).items()},
-    }
-    if status == "succeeded":
-        verdict: Verdict = "verified"
-    elif status in ("unverified", "needs_clarification"):
-        verdict = "uncertain"
-    else:
-        verdict = "failed"
 
-    evidence = str(getattr(result, "detail", ""))[:MAX_EVIDENCE_CHARS]
+    # The evidence transport. execute_desktop_control puts
+    # DesktopOutcome.audit_payload() -- a bounded projection of counts, codes
+    # and a clipped detail, never window titles or UI values -- into
+    # spoken_metadata, exactly as the file_search verifier reads its envelope.
+    #
+    # This previously read result.action / result.status / result.windows,
+    # which are DesktopOutcome attributes. The executor hands the verifier an
+    # OrchestratorResult, so every one of them was missing and `status`
+    # defaulted to "failed": a physically opened Notepad was logged as
+    # verdict=failed while the user saw "Notepad is open." Reading the wrong
+    # object is why the two disagreed, so there is deliberately no fallback to
+    # the DesktopOutcome shape here -- one transport, or fail closed.
+    metadata = dict(getattr(result, "spoken_metadata", {}) or {})
+    action_type = getattr(result, "action_type", None)
+    observed: dict[str, Any] = {
+        "action_type": action_type,
+        "action": metadata.get("action"),
+        "status": metadata.get("status"),
+        "target": metadata.get("target"),
+        "window_count": metadata.get("window_count"),
+        "node_count": metadata.get("node_count"),
+    }
+    if metadata.get("error_code"):
+        observed["error_code"] = metadata["error_code"]
+    observed.update(
+        {
+            str(key): value
+            for key, value in metadata.items()
+            if str(key).startswith("evidence_")
+        }
+    )
+
+    if action_type != "desktop_control":
+        return VerificationResult(
+            "desktop_control",
+            "failed",
+            expected,
+            observed,
+            "desktop action produced a non-desktop result envelope",
+        )
+
+    status = metadata.get("status")
+    observed_action = metadata.get("action")
+
+    if not isinstance(status, str) or status not in _DESKTOP_STATUS_VERDICTS:
+        # No usable observation. Not proof of success, and not proof of
+        # failure either -- the honest verdict is that we cannot tell.
+        return VerificationResult(
+            "desktop_control",
+            "uncertain",
+            expected,
+            observed,
+            "desktop outcome carried no recognisable status; nothing was verified",
+        )
+
+    if requested_action and observed_action != requested_action:
+        # The system did something other than what was asked. That is a real
+        # correctness failure, not an unproven one.
+        return VerificationResult(
+            "desktop_control",
+            "failed",
+            expected,
+            observed,
+            f"executed action {observed_action!r} did not match requested {requested_action!r}",
+        )
+
+    # Evidence text comes from the controller's own bounded detail, never from
+    # the user-facing reply: "Notepad is open." is prose, not proof.
+    evidence = str(metadata.get("detail", "") or "")[:MAX_EVIDENCE_CHARS]
     return VerificationResult(
         verifier_name="desktop_control",
-        verdict=verdict,
+        verdict=_DESKTOP_STATUS_VERDICTS[status],
         expected=expected,
         observed=observed,
         evidence_text=evidence,

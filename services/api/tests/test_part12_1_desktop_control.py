@@ -33,6 +33,7 @@ from services.api.app.desktop.models import (
 from services.api.app.desktop.ui_automation import find_controls
 from services.api.app.risk_policy import ApprovalPolicy, RiskLevel
 from services.api.app.tool_requests import ToolRequestValidationError, build_request
+from services.api.app.orchestrator import OrchestratorResult
 from services.api.app.verification_service import verify_desktop_control
 
 
@@ -325,6 +326,10 @@ class VerificationTests(unittest.TestCase):
         self.assertIn("not the foreground window", outcome.detail)
 
     def test_15b_verifier_maps_every_status_honestly(self) -> None:
+        """Through the REAL transport: the executor hands the verifier an
+        OrchestratorResult, not a DesktopOutcome. Asserting against a raw
+        DesktopOutcome is what let a genuine shape mismatch pass unnoticed
+        while every live desktop action logged verdict=failed."""
         for status, expected in (
             ("succeeded", "verified"),
             ("unverified", "uncertain"),
@@ -336,7 +341,19 @@ class VerificationTests(unittest.TestCase):
                 outcome = DesktopOutcome(
                     action=DesktopAction.OPEN_APP, status=status, target="notepad"
                 )
-                self.assertEqual(verify_desktop_control(object(), outcome).verdict, expected)
+                transported = OrchestratorResult(
+                    reply="",
+                    action_type="desktop_control",
+                    memory_content="",
+                    spoken_metadata=outcome.audit_payload(),
+                )
+                request = build_request(
+                    "desktop_control", "Open Notepad.",
+                    {"action": "open_app", "target": "notepad"},
+                )
+                self.assertEqual(
+                    verify_desktop_control(request, transported).verdict, expected
+                )
 
     def test_focus_on_a_closed_app_fails_rather_than_launching_it(self) -> None:
         backend = FakeWindowBackend([])
