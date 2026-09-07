@@ -23,7 +23,8 @@ Two strategies, both argv-list based (never a shell string):
                  e.g. ["explorer.exe", "shell:AppsFolder\\..."]. Used for the
                  packaged (Store/UWP) apps that have no plain executable.
 
-`shell=True` is never used anywhere in this package.
+No shell is ever invoked anywhere in this package: every launch goes through
+`subprocess.Popen(argv, shell=False)`.
 """
 
 from __future__ import annotations
@@ -131,8 +132,8 @@ def _entry(**kwargs) -> ApplicationEntry:
         raise ValueError(f"invalid app_id: {entry.app_id!r}")
     if not entry.launch_argv:
         raise ValueError(f"{entry.app_id} has no launch argv")
-    # A launch argv must never contain shell metacharacters: even though we
-    # never use shell=True, an argv element carrying them signals a mistake.
+    # A launch argv must never contain shell metacharacters: even though no
+    # shell is ever invoked, an argv element carrying them signals a mistake.
     if any(any(ch in part for ch in "&|;<>^`") for part in entry.launch_argv):
         raise ValueError(f"{entry.app_id} launch argv contains shell metacharacters")
     if entry.system_critical and entry.closable:
