@@ -243,7 +243,11 @@ def reset_discovery_cache() -> None:
 
 
 def _probe_tesseract_langs() -> str | None:
-    """Ask an installed tesseract where its tessdata is, without shell=True."""
+    """Ask an installed tesseract where its tessdata is, without a shell.
+
+    The call below passes an explicit argv list and never a command string, so
+    no shell parses it and a path containing spaces needs no quoting.
+    """
     executable = shutil.which("tesseract")
     if not executable:
         return None
