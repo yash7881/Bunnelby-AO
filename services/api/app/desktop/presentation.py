@@ -60,6 +60,20 @@ def screen_reply(outcome: DesktopOutcome) -> str:
 
 def spoken_reply(outcome: DesktopOutcome) -> str:
     """Short spoken form. Never claims more than the status supports."""
+    if outcome.status == "unverified" and outcome.action is DesktopAction.FOCUS_APP:
+        # Read the EVIDENCE, never the prose. A focus that Windows refused may
+        # still have restored the window and flagged it in the taskbar, and
+        # saying so is more useful than a flat "I couldn't do that" -- while
+        # still never claiming the window came forward.
+        restored = bool(outcome.evidence.get("restored"))
+        attention = bool(outcome.evidence.get("attention_requested"))
+        if restored and attention:
+            return "I restored it, but Windows wouldn't let me bring it forward, so I flagged it in the taskbar."
+        if restored:
+            return "I restored it, but Windows wouldn't let me bring it forward."
+        if attention:
+            return "Windows wouldn't let me bring it forward, so I flagged it in the taskbar."
+        return "Windows wouldn't let me bring that to the front."
     if outcome.status == "succeeded":
         if outcome.action is DesktopAction.LIST_WINDOWS:
             count = len(outcome.windows)

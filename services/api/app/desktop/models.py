@@ -211,6 +211,12 @@ class WindowInfo:
     pid: int
     process_name: str
     is_foreground: bool = False
+    #: True when the window is iconic (minimized to the taskbar). Deliberately
+    #: separate from visibility: Win32 reports a minimized window as VISIBLE,
+    #: so `IsWindowVisible` cannot answer "can the user see this". The backend
+    #: knew this from IsIconic and used to discard it, which made "Bunnelby
+    #: restored your window" unprovable after the fact.
+    is_minimized: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "title", _clip(self.title, MAX_TITLE_CHARS))
@@ -224,6 +230,7 @@ class WindowInfo:
             "pid": self.pid,
             "process_name": self.process_name,
             "is_foreground": self.is_foreground,
+            "is_minimized": self.is_minimized,
         }
 
 

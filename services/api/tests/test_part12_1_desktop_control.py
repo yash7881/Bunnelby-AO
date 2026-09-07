@@ -31,6 +31,7 @@ from services.api.app.desktop.models import (
     bounded_timeout,
 )
 from services.api.app.desktop.ui_automation import find_controls
+from services.api.app.desktop.windows_api import FocusAttempt
 from services.api.app.risk_policy import ApprovalPolicy, RiskLevel
 from services.api.app.tool_requests import ToolRequestValidationError, build_request
 from services.api.app.orchestrator import OrchestratorResult
@@ -43,18 +44,49 @@ from services.api.app.verification_service import verify_desktop_control
 
 
 class FakeWindowBackend:
-    """In-memory desktop. Records every call so behaviour can be asserted."""
+    """In-memory desktop. Records every call so behaviour can be asserted.
 
-    def __init__(self, windows=(), *, focus_succeeds=True, close_succeeds=True):
+    Part 12.2 extends it to model the reality the controller now observes:
+    minimized state, an activation attempt whose Win32 return value is
+    INDEPENDENT of whether the window actually ends up in front, invalidated
+    handles, and attention requests. Driving these from the fake is what lets
+    "the API said yes but reality said no" be tested without touching ctypes.
+    """
+
+    def __init__(
+        self,
+        windows=(),
+        *,
+        focus_succeeds=True,
+        close_succeeds=True,
+        set_foreground_returns=None,
+        flash_succeeds=True,
+    ):
         self._windows = list(windows)
+        #: Whether the OS actually moves foreground to the requested window.
         self.focus_succeeds = focus_succeeds
         self.close_succeeds = close_succeeds
+        #: What SetForegroundWindow claims. Defaults to matching reality; set it
+        #: explicitly to model the two cases where the BOOL lies.
+        self.set_foreground_returns = (
+            focus_succeeds if set_foreground_returns is None else set_foreground_returns
+        )
+        self.flash_succeeds = flash_succeeds
         self.launched: list[tuple[str, ...]] = []
         self.closed: list[int] = []
         self.focused: list[int] = []
+        self.flashed: list[int] = []
         self._foreground = self._windows[0].handle if self._windows else 0
         #: Windows that appear only after a launch, to model app startup.
         self.launch_spawns: list[WindowInfo] = []
+        #: Handles that vanish the moment focus is attempted, to model a window
+        #: closed or recreated between selection and verification.
+        self.invalidate_on_focus: set[int] = set()
+        #: Windows that appear when an invalidated handle disappears.
+        self.replacement_windows: list[WindowInfo] = []
+        #: Foreground to install after a successful focus, when the app answers
+        #: under a DIFFERENT window of its own.
+        self.foreground_override: dict[int, int] = {}
 
     def is_available(self) -> bool:
         return True
@@ -67,6 +99,7 @@ class FakeWindowBackend:
                 pid=w.pid,
                 process_name=w.process_name,
                 is_foreground=w.handle == self._foreground,
+                is_minimized=w.is_minimized,
             )
             for w in self._windows
         )
@@ -74,11 +107,49 @@ class FakeWindowBackend:
     def foreground_handle(self) -> int:
         return self._foreground
 
-    def focus(self, handle: int) -> bool:
+    def focus(self, handle: int) -> FocusAttempt:
         self.focused.append(handle)
+        existing = next((w for w in self._windows if w.handle == handle), None)
+        was_minimized = bool(existing.is_minimized) if existing else False
+
+        if handle in self.invalidate_on_focus:
+            # The window died before we could act on it.
+            self._windows = [w for w in self._windows if w.handle != handle]
+            self._windows.extend(self.replacement_windows)
+            self.replacement_windows = []
+            return FocusAttempt(
+                handle=handle,
+                was_minimized=was_minimized,
+                restore_requested=was_minimized,
+                set_foreground_returned=False,
+            )
+
+        if was_minimized and existing is not None:
+            self._windows = [
+                WindowInfo(
+                    handle=w.handle,
+                    title=w.title,
+                    pid=w.pid,
+                    process_name=w.process_name,
+                    is_foreground=w.is_foreground,
+                    is_minimized=False if w.handle == handle else w.is_minimized,
+                )
+                for w in self._windows
+            ]
+
         if self.focus_succeeds:
-            self._foreground = handle
-        return self.focus_succeeds
+            self._foreground = self.foreground_override.get(handle, handle)
+
+        return FocusAttempt(
+            handle=handle,
+            was_minimized=was_minimized,
+            restore_requested=was_minimized,
+            set_foreground_returned=bool(self.set_foreground_returns),
+        )
+
+    def flash(self, handle: int, count: int = 3) -> bool:
+        self.flashed.append(handle)
+        return bool(self.flash_succeeds)
 
     def request_close(self, handle: int) -> bool:
         self.closed.append(handle)
@@ -134,8 +205,14 @@ def pathlib_read(path) -> str:
     return pathlib.Path(str(path)).read_text(encoding="utf-8")
 
 
-def window(handle, title, pid, process_name):
-    return WindowInfo(handle=handle, title=title, pid=pid, process_name=process_name)
+def window(handle, title, pid, process_name, *, minimized=False):
+    return WindowInfo(
+        handle=handle,
+        title=title,
+        pid=pid,
+        process_name=process_name,
+        is_minimized=minimized,
+    )
 
 
 NOTEPAD = window(101, "Untitled - Notepad", 900, "notepad.exe")
@@ -323,7 +400,12 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(outcome.status, "unverified")
         self.assertEqual(outcome.error_code, "foreground_denied")
         self.assertFalse(outcome.succeeded)
-        self.assertIn("not the foreground window", outcome.detail)
+        # Part 12.2 reworded this to say what Windows did and what Bunnelby did
+        # instead. The invariant under test is unchanged: it must report the
+        # block and must never claim the window came forward.
+        self.assertIn("Windows blocked the focus change", outcome.detail)
+        self.assertNotIn("is now in front", outcome.detail)
+        self.assertFalse(outcome.evidence["foreground_after"])
 
     def test_15b_verifier_maps_every_status_honestly(self) -> None:
         """Through the REAL transport: the executor hands the verifier an

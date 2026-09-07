@@ -27,7 +27,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any, Callable, Sequence
 
 from . import app_registry, shortcuts as shortcut_policy
 from .app_registry import ApplicationEntry
@@ -49,7 +50,13 @@ from .models import (
     limit_windows,
 )
 from .ui_automation import UiTreeProvider, default_provider, find_controls
-from .windows_api import WindowBackend, default_backend, wait_until
+from .windows_api import (
+    MAX_FLASH_COUNT,
+    FocusAttempt,
+    WindowBackend,
+    default_backend,
+    wait_until,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +156,60 @@ class DesktopController:
 
         wait_until(_look, timeout=window_grace, clock=self._clock, sleep=self._sleep)
         return found[0]
+
+    def _window_by_handle(self, handle: int) -> WindowInfo | None:
+        for window in self._backend.list_windows():
+            if window.handle == handle:
+                return window
+        return None
+
+    def _foreground_reality(self, entry: ApplicationEntry) -> _ForegroundReality:
+        """Observe what is in front RIGHT NOW and whether it belongs to `entry`."""
+        handle = self._backend.foreground_handle()
+        window = self._window_by_handle(handle) if handle else None
+        evidence = (
+            entry.match_window(window.process_name, window.title)
+            if window is not None
+            else None
+        )
+        return _ForegroundReality(handle=handle, window=window, evidence=evidence)
+
+    def _verify_foreground(
+        self, entry: ApplicationEntry, chosen: WindowInfo, timeout: float
+    ) -> _ForegroundReality:
+        """Poll until the app is in front, or the bounded deadline passes.
+
+        Activation is asynchronous, so the Win32 return value cannot decide
+        this: live diagnostics caught SetForegroundWindow reporting False for a
+        focus that succeeded. Only observed state counts.
+        """
+        wait_until(
+            lambda: self._foreground_reality(entry).is_target,
+            timeout=timeout,
+            clock=self._clock,
+            sleep=self._sleep,
+        )
+        return self._foreground_reality(entry)
+
+    def _request_attention(
+        self, handle: int, after: _ForegroundReality
+    ) -> bool:
+        """Flash the taskbar button, under every safety precondition.
+
+        Never called when the target is already in front, never against a dead
+        handle, and never able to change a verdict. A failure here is silent by
+        design: attention is a courtesy, and losing it must not turn an honest
+        `unverified` into an error.
+        """
+        if after.handle == handle:
+            return False
+        if not self._backend.is_window(handle):
+            return False
+        try:
+            return bool(self._backend.flash(handle, MAX_FLASH_COUNT))
+        except Exception:  # noqa: BLE001 - see docstring
+            logger.debug("Attention request failed for handle %s", handle, exc_info=True)
+            return False
 
     def _elapsed_ms(self, started: float) -> float:
         return (self._clock() - started) * 1000.0
@@ -289,15 +350,18 @@ class DesktopController:
                     status=focused.status,
                     target=entry.app_id,
                     windows=focused.windows or existing,
-                    detail=(
-                        f"{entry.display_name} was already running; "
-                        f"{focused.detail[:1].lower()}{focused.detail[1:]}"
-                        if focused.detail
-                        else f"{entry.display_name} was already running."
-                    ),
+                    detail=_already_running_detail(entry.display_name, focused),
                     error_code=focused.error_code,
                     latency_ms=self._elapsed_ms(started),
-                    evidence={"already_running": True, **dict(focused.evidence)},
+                    evidence={
+                        # The app IS open -- that is verified fact, and it must
+                        # survive even when the focus half is refused. Without
+                        # this the reply reads as if opening had failed.
+                        "already_running": True,
+                        "application_open": True,
+                        "foreground_verified": focused.status == "succeeded",
+                        **dict(focused.evidence),
+                    },
                 )
 
             try:
@@ -372,46 +436,107 @@ class DesktopController:
                     latency_ms=self._elapsed_ms(started),
                 )
 
+            before_foreground = self._foreground_reality(entry)
             chosen = _preferred_window(windows)
-            self._backend.focus(chosen.handle)
-            # VERIFY: ask the OS what is actually in front, not what we asked for.
-            became = wait_until(
-                lambda: self._backend.foreground_handle() == chosen.handle,
-                timeout=wait_for,
-                clock=self._clock,
-                sleep=self._sleep,
-            )
-            observed = self._backend.foreground_handle()
 
-        if not became:
-            # Windows restricts which processes may steal focus. Reporting this
-            # honestly is required; pretending it worked is not an option.
+            # ALREADY THERE. Asking Windows to raise a window that is already
+            # in front is a pointless state change, and a refusal of it would
+            # be reported as a failure of something that was already true.
+            if before_foreground.is_target and before_foreground.handle == chosen.handle:
+                return DesktopOutcome(
+                    action=DesktopAction.FOCUS_APP,
+                    status="succeeded",
+                    target=entry.app_id,
+                    windows=(chosen,),
+                    detail=f"{entry.display_name} is already in front.",
+                    latency_ms=self._elapsed_ms(started),
+                    evidence={
+                        "already_foreground": True,
+                        "verified": True,
+                        "expected_handle": chosen.handle,
+                        "foreground_handle": before_foreground.handle,
+                        "attention_requested": False,
+                    },
+                )
+
+            attempt = self._backend.focus(chosen.handle)
+            after = self._verify_foreground(entry, chosen, wait_for)
+
+            # STALE HANDLE. The one case where a second attempt is justified:
+            # the window we selected no longer exists, so nothing was ever
+            # asked of the right target. A plain refusal is NOT this case and
+            # gets no retry -- repeated activation was measured to never
+            # recover (9/9 denials over three trials).
+            stale = not self._backend.is_window(chosen.handle)
+            replacement: WindowInfo | None = None
+            if not after.is_target and stale:
+                candidates = tuple(
+                    window
+                    for window, evidence in self._attributed_windows(entry)
+                    if evidence.is_strong and window.handle != chosen.handle
+                )
+                if candidates:
+                    replacement = _preferred_window(candidates)
+                    attempt = self._backend.focus(replacement.handle)
+                    after = self._verify_foreground(entry, replacement, wait_for)
+
+        target_window = replacement or chosen
+        observed_now = self._window_by_handle(target_window.handle)
+        evidence: dict[str, Any] = {
+            "expected_handle": target_window.handle,
+            "observed_handle": after.handle,
+            "was_minimized": attempt.was_minimized,
+            "restored": bool(attempt.was_minimized and observed_now is not None
+                             and not observed_now.is_minimized),
+            "visible_after": observed_now is not None,
+            "foreground_after": after.is_target,
+            "set_foreground_returned": attempt.set_foreground_returned,
+            "already_foreground": False,
+        }
+        if replacement is not None:
+            evidence["stale_handle_detected"] = True
+            evidence["replacement_handle"] = replacement.handle
+        if after.is_target and after.handle != target_window.handle:
+            # The app IS in front, under a different window of its own. For an
+            # APP-level request that is the user's intent satisfied; it is only
+            # allowed because the observed foreground window carries strong
+            # identity, never a title match.
+            evidence["foreground_equivalent_handle"] = True
+            evidence["foreground_owner_evidence"] = (
+                after.evidence.value if after.evidence else ""
+            )
+
+        if after.is_target:
+            evidence["verified"] = True
+            evidence["attention_requested"] = False
             return DesktopOutcome(
                 action=DesktopAction.FOCUS_APP,
-                status="unverified",
+                status="succeeded",
                 target=entry.app_id,
-                windows=(chosen,),
-                detail=(
-                    f"Asked Windows to bring {entry.display_name} to the front, but it is "
-                    "not the foreground window. Windows restricts focus changes from "
-                    "background processes."
-                ),
-                error_code="foreground_denied",
+                windows=(observed_now or target_window,),
+                detail=f"{entry.display_name} is now in front.",
                 latency_ms=self._elapsed_ms(started),
-                evidence={
-                    "expected_handle": chosen.handle,
-                    "observed_handle": observed,
-                    "verified": False,
-                },
+                evidence=evidence,
             )
+
+        # Windows refused. Ask for the user's attention instead -- which is a
+        # request, not an activation, and must never upgrade this verdict.
+        attention = self._request_attention(target_window.handle, after)
+        evidence["verified"] = False
+        evidence["attention_requested"] = attention
         return DesktopOutcome(
             action=DesktopAction.FOCUS_APP,
-            status="succeeded",
+            status="unverified",
             target=entry.app_id,
-            windows=(chosen,),
-            detail=f"{entry.display_name} is now in front.",
+            windows=(observed_now or target_window,),
+            detail=_focus_denied_detail(
+                entry.display_name,
+                restored=bool(evidence["restored"]),
+                attention=attention,
+            ),
+            error_code="foreground_denied",
             latency_ms=self._elapsed_ms(started),
-            evidence={"expected_handle": chosen.handle, "verified": True},
+            evidence=evidence,
         )
 
     def close_app(self, target: str, *, timeout: float | None = None) -> DesktopOutcome:
@@ -571,6 +696,70 @@ class DesktopController:
         )
 
 
+def _already_running_detail(display_name: str, focused: DesktopOutcome) -> str:
+    """One sentence for "it was already open, and here is what happened next".
+
+    Composed from the focus outcome's STATUS and EVIDENCE rather than by
+    lower-casing and splicing that outcome's own sentence, which produced
+    "Calculator was already running; calculator is now in front." The app name
+    appears once, in one grammatical sentence, and every branch stays tied to
+    what was actually observed -- a refused focus still says so.
+    """
+    if focused.status == "succeeded":
+        if focused.evidence.get("already_foreground"):
+            return f"{display_name} was already running and in front."
+        return f"{display_name} was already running and is now in front."
+
+    if focused.status == "unverified":
+        restored = bool(focused.evidence.get("restored"))
+        attention = bool(focused.evidence.get("attention_requested"))
+        opening = (
+            f"{display_name} was already running and has been restored, but"
+            if restored
+            else f"{display_name} was already running, but"
+        )
+        if attention:
+            return (
+                f"{opening} Windows did not allow Bunnelby to bring it to the "
+                "front, so I highlighted it in the taskbar."
+            )
+        return f"{opening} Windows did not allow Bunnelby to bring it to the front."
+
+    # failed / blocked: the focus half has its own truthful sentence, and the
+    # app-open fact still deserves saying.
+    if focused.detail:
+        return f"{display_name} was already running. {focused.detail}"
+    return f"{display_name} was already running."
+
+
+def _focus_denied_detail(display_name: str, *, restored: bool, attention: bool) -> str:
+    """Say exactly what happened, including the part that DID work.
+
+    Reporting only "I could not focus it" would hide a real change: restoring a
+    minimized window succeeds even when activation is refused, and the user can
+    see that it happened.
+    """
+    if restored and attention:
+        return (
+            f"{display_name} was restored, but Windows blocked the focus change, "
+            "so I highlighted it in the taskbar."
+        )
+    if restored:
+        return (
+            f"{display_name} was restored, but Windows did not allow Bunnelby to "
+            "bring it to the front."
+        )
+    if attention:
+        return (
+            f"I couldn't bring {display_name} to the front because Windows blocked "
+            "the focus change, so I highlighted it in the taskbar."
+        )
+    return (
+        f"I couldn't bring {display_name} to the front because Windows blocked the "
+        "focus change."
+    )
+
+
 class _NullContext:
     """Re-entrancy helper for the open->focus path, which already holds the lock."""
 
@@ -581,17 +770,47 @@ class _NullContext:
         return False
 
 
+@dataclass(frozen=True, slots=True)
+class _ForegroundReality:
+    """What the OS actually shows, and whose window it is.
+
+    Separated from the verdict on purpose: this records observation, and the
+    caller decides what it means.
+    """
+
+    handle: int
+    window: WindowInfo | None
+    evidence: MatchEvidence | None
+
+    @property
+    def is_target(self) -> bool:
+        """True when the foreground window is strongly attributable to the app.
+
+        STRONG ONLY. A title-only match means the owning process could not be
+        read and any program could have named its window that way -- enough to
+        describe a window, never enough to certify that the user's application
+        is the thing they are now looking at.
+        """
+        return self.evidence is not None and self.evidence.is_strong
+
+
 def _preferred_window(windows: Sequence[WindowInfo]) -> WindowInfo:
     """Deterministic choice when an app has several windows.
 
-    Rule: prefer the one already in the foreground, otherwise the lowest handle.
-    Lowest-handle is arbitrary but STABLE, which is what matters -- the same
-    request must pick the same window every time so verification is meaningful.
+    Order: already foreground, then non-minimized, then minimized, with the
+    lowest handle as a tie-break. Preferring a window the user can already see
+    means the least disruptive action wins -- restoring something they had
+    deliberately minimized is a bigger intervention than raising something
+    already on screen.
+
+    Lowest-handle is arbitrary but STABLE, and stability is the point: the same
+    request must pick the same window every time or verification means nothing.
+    There is no fuzziness and no randomness anywhere in this rule.
     """
-    for window in windows:
-        if window.is_foreground:
-            return window
-    return sorted(windows, key=lambda item: item.handle)[0]
+    return sorted(
+        windows,
+        key=lambda item: (not item.is_foreground, item.is_minimized, item.handle),
+    )[0]
 
 
 def _confirmation_window(

@@ -14,6 +14,11 @@ DELIBERATELY ABSENT, and not an oversight:
 
 `SendInput` IS used, but only by shortcuts.py and only for combinations on a
 reviewed allowlist that cannot reach the secure desktop.
+
+`FlashWindowEx` IS used, and is not an activation call: it asks the shell to
+draw the user's eye to a window that Windows would not let us raise. It moves
+no focus, sends no input, and never converts an unverified focus into a
+success.
 """
 
 from __future__ import annotations
@@ -22,7 +27,8 @@ import logging
 import subprocess
 import sys
 import time
-from typing import Protocol, Sequence
+from dataclasses import dataclass
+from typing import Final, Protocol, Sequence
 
 from .models import (
     POLL_INTERVAL_SECONDS,
@@ -40,6 +46,43 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _SW_RESTORE = 9
 _SW_SHOW = 5
 
+# FlashWindowEx (winuser.h). FLASHW_TRAY flashes the taskbar button only --
+# deliberately not FLASHW_ALL, which would also flash the caption of a window
+# the user did not ask to see.
+_FLASHW_STOP = 0x00000000
+_FLASHW_TRAY = 0x00000002
+_FLASHW_TIMERNOFG = 0x0000000C
+
+#: How many times the taskbar button may blink. Small and finite: this is a
+#: nudge, not an alarm, and an unbounded flash would be a nuisance the user
+#: cannot dismiss.
+MAX_FLASH_COUNT: Final[int] = 3
+
+
+@dataclass(frozen=True, slots=True)
+class FocusAttempt:
+    """What the OS was ASKED to do, and what it said -- never the final truth.
+
+    The previous `focus() -> bool` conflated the request with the outcome by
+    sampling GetForegroundWindow() synchronously right after
+    SetForegroundWindow. Activation is asynchronous, so that sample raced: live
+    diagnostics caught it returning False for a focus that had in fact
+    succeeded, and it would equally return True for one that was about to be
+    overridden.
+
+    So the backend now reports only the ATTEMPT. Whether the target actually
+    ended up in front is decided by the controller, which observes real state
+    afterwards. A Win32 BOOL may never by itself produce a success verdict.
+    """
+
+    handle: int
+    was_minimized: bool = False
+    restore_requested: bool = False
+    set_foreground_returned: bool = False
+    #: GetLastError() after the call. SetForegroundWindow does not document a
+    #: meaningful error code, so this is diagnostic only.
+    last_error: int = 0
+
 
 class WindowBackend(Protocol):
     """The only surface the desktop controller may use to touch windows."""
@@ -52,8 +95,16 @@ class WindowBackend(Protocol):
 
     def foreground_handle(self) -> int: ...
 
-    def focus(self, handle: int) -> bool:
-        """Attempt to foreground a window. False means Windows refused."""
+    def focus(self, handle: int) -> FocusAttempt:
+        """Ask Windows to restore and foreground a window.
+
+        Reports what was attempted. It does NOT report whether the window ended
+        up in front -- only the controller's after-observation decides that.
+        """
+        ...
+
+    def flash(self, handle: int, count: int = MAX_FLASH_COUNT) -> bool:
+        """Request the user's attention for a window. Never moves focus."""
         ...
 
     def request_close(self, handle: int) -> bool:
@@ -87,7 +138,11 @@ class UnavailableWindowBackend:
         self._refuse()
         return 0
 
-    def focus(self, handle: int) -> bool:
+    def focus(self, handle: int) -> FocusAttempt:
+        self._refuse()
+        return FocusAttempt(handle)
+
+    def flash(self, handle: int, count: int = MAX_FLASH_COUNT) -> bool:
         self._refuse()
         return False
 
@@ -127,6 +182,8 @@ class Win32WindowBackend:
         self._user32.SetForegroundWindow.argtypes = [wintypes.HWND]
         self._user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         self._user32.IsIconic.argtypes = [wintypes.HWND]
+        self._user32.SetForegroundWindow.restype = wintypes.BOOL
+        self._user32.ShowWindow.restype = wintypes.BOOL
         self._user32.PostMessageW.argtypes = [
             wintypes.HWND,
             wintypes.UINT,
@@ -166,6 +223,9 @@ class Win32WindowBackend:
                         pid=int(pid.value),
                         process_name=self._process_name(int(pid.value)),
                         is_foreground=int(hwnd) == foreground,
+                        # A minimized window is still IsWindowVisible, so this
+                        # is the only signal that the user cannot see it.
+                        is_minimized=bool(user32.IsIconic(hwnd)),
                     )
                 )
             except Exception:  # noqa: BLE001 - one bad window must not abort the scan
@@ -208,21 +268,73 @@ class Win32WindowBackend:
 
     # -- state changes ------------------------------------------------------ #
 
-    def focus(self, handle: int) -> bool:
-        """Restore-then-foreground, then report what actually happened.
+    def focus(self, handle: int) -> FocusAttempt:
+        """Restore if minimized, then ask once for the foreground.
 
-        Windows enforces foreground-activation rules that a background process
-        cannot override, and we do not try to: no AttachThreadInput trickery,
-        no AllowSetForegroundWindow abuse. If the OS declines, the caller
-        reports a truthful partial state instead of claiming success.
+        ONE activation attempt. Windows enforces foreground rules a background
+        process cannot override, and we do not try to: no AttachThreadInput,
+        no AllowSetForegroundWindow abuse, no foreground-lock registry change,
+        no synthetic input. Live measurement showed repeated attempts never
+        recover a refusal (9/9 denials across three trials), so retrying here
+        would cost latency and buy nothing.
+
+        Restoring, by contrast, DOES work even when activation is refused --
+        which is exactly the partial reality the caller must be able to report.
         """
+        ctypes = self._ctypes
         hwnd = self._wintypes.HWND(handle)
-        if self._user32.IsIconic(hwnd):
-            self._user32.ShowWindow(hwnd, _SW_RESTORE)
-        else:
-            self._user32.ShowWindow(hwnd, _SW_SHOW)
-        self._user32.SetForegroundWindow(hwnd)
-        return self.foreground_handle() == handle
+
+        was_minimized = bool(self._user32.IsIconic(hwnd))
+        self._user32.ShowWindow(hwnd, _SW_RESTORE if was_minimized else _SW_SHOW)
+
+        ctypes.set_last_error(0)
+        raised = bool(self._user32.SetForegroundWindow(hwnd))
+        last_error = ctypes.get_last_error()
+
+        return FocusAttempt(
+            handle=handle,
+            was_minimized=was_minimized,
+            restore_requested=was_minimized,
+            set_foreground_returned=raised,
+            last_error=int(last_error),
+        )
+
+    def flash(self, handle: int, count: int = MAX_FLASH_COUNT) -> bool:
+        """Blink the taskbar button to request attention. Not activation.
+
+        Used only when Windows has refused to raise a window we were asked to
+        show. It changes no focus and synthesises no input; the user stays in
+        control of what comes forward. Bounded blink count, and FLASHW_TIMERNOFG
+        stops it as soon as the window does come to the foreground.
+        """
+        ctypes, wintypes = self._ctypes, self._wintypes
+
+        class _FlashInfo(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("hwnd", wintypes.HWND),
+                ("dwFlags", wintypes.DWORD),
+                ("uCount", wintypes.UINT),
+                ("dwTimeout", wintypes.DWORD),
+            ]
+
+        bounded = max(1, min(int(count), MAX_FLASH_COUNT))
+        info = _FlashInfo(
+            cbSize=ctypes.sizeof(_FlashInfo),
+            hwnd=wintypes.HWND(handle),
+            dwFlags=_FLASHW_TRAY | _FLASHW_TIMERNOFG,
+            uCount=bounded,
+            dwTimeout=0,
+        )
+        try:
+            self._user32.FlashWindowEx(ctypes.byref(info))
+        except Exception:  # noqa: BLE001 - attention is a nicety, never a failure
+            logger.debug("FlashWindowEx failed for handle %s", handle, exc_info=True)
+            return False
+        # FlashWindowEx returns the window's PREVIOUS flash state, not success,
+        # so it cannot be used as a result. Reaching here without raising is the
+        # only thing we can honestly claim.
+        return True
 
     def request_close(self, handle: int) -> bool:
         """Ask the window to close, exactly as clicking its X would.
