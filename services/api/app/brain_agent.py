@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final, Literal, Mapping
@@ -451,8 +450,16 @@ def decision_response_schema() -> dict[str, Any]:
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
+        # Deterministic string ops, not regex: a `\s*` run anchored only at the
+        # end (`\s*```$`) is retried by re.sub at every start position in the
+        # string, which is quadratic on adversarial whitespace-heavy model
+        # output. strip/slicing is linear and has no backtracking.
+        cleaned = cleaned[3:]
+        if cleaned[:4].casefold() == "json":
+            cleaned = cleaned[4:]
+        cleaned = cleaned.lstrip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].rstrip()
     try:
         payload = json.loads(cleaned)
         if isinstance(payload, dict):

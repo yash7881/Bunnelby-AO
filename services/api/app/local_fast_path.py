@@ -154,31 +154,73 @@ _LIST_WINDOWS_PHRASES: Final[frozenset[str]] = frozenset(
 )
 
 # --------------------------------------------------------------------------- #
-# Grammar. Every pattern is fullmatch-anchored against the WHOLE normalised
-# utterance, so an extra clause can never be ignored.
+# Grammar. Deterministic word-sequence matching against the WHOLE normalised
+# utterance (already whitespace-collapsed by normalize()), so an extra clause
+# can never be ignored.
+#
+# This used to be regex-based, with the target captured by `.+` / `.+?` next
+# to `\s+` boundaries -- an ambiguous-repetition shape (`.` overlaps `\s`)
+# that is polynomial to backtrack on adversarial input. Word-sequence
+# comparison is O(n) in the word count and has no backtracking at all, and
+# because `normalize()` already reduces the utterance to single-space-joined
+# words, comparing word tuples is exactly equivalent to the old
+# prefix/suffix + \s+ + .+ matching, alternative-order preserved.
 # --------------------------------------------------------------------------- #
-_TEMPLATES: Final[tuple[tuple[str, Pattern[str]], ...]] = (
-    # -- English: verb first ------------------------------------------------- #
-    ("open_app", re.compile(r"(?:open|launch|start)\s+(?P<target>.+)")),
-    ("focus_app", re.compile(r"(?:switch\s+to|switch|focus\s+on|focus)\s+(?P<target>.+)")),
-    ("close_app", re.compile(r"(?:close|quit)\s+(?P<target>.+)")),
-    # -- Hinglish: target first, verb last ----------------------------------- #
-    # A closed list of exact phrasings. No general Hindi parsing is attempted.
-    (
-        "open_app",
-        re.compile(r"(?P<target>.+?)\s+(?:kholo|khol\s+do|open\s+karo|chalu\s+karo)"),
-    ),
+_ENGLISH_TEMPLATES: Final[tuple[tuple[str, tuple[tuple[str, ...], ...]], ...]] = (
+    # verb first; target is everything after the (first matching) verb phrase.
+    ("open_app", (("open",), ("launch",), ("start",))),
+    ("focus_app", (("switch", "to"), ("switch",), ("focus", "on"), ("focus",))),
+    ("close_app", (("close",), ("quit",))),
+)
+
+#: Hinglish: target first, verb last. A closed list of exact phrasings. No
+#: general Hindi parsing is attempted.
+_HINGLISH_TEMPLATES: Final[tuple[tuple[str, tuple[tuple[str, ...], ...]], ...]] = (
+    ("open_app", (("kholo",), ("khol", "do"), ("open", "karo"), ("chalu", "karo"))),
     (
         "focus_app",
-        re.compile(r"(?P<target>.+?)\s+(?:pe|par)\s+switch\s+(?:karo|kar\s+do)"),
+        (
+            ("pe", "switch", "karo"),
+            ("pe", "switch", "kar", "do"),
+            ("par", "switch", "karo"),
+            ("par", "switch", "kar", "do"),
+        ),
     ),
     (
         "close_app",
-        re.compile(
-            r"(?P<target>.+?)\s+(?:band\s+karo|band\s+kar\s+do|bandh\s+karo|close\s+karo)"
-        ),
+        (("band", "karo"), ("band", "kar", "do"), ("bandh", "karo"), ("close", "karo")),
     ),
 )
+
+#: Combined, in the exact priority order the old flat template tuple used:
+#: English verb-first templates, then Hinglish target-first templates.
+_TEMPLATES: Final[tuple[tuple[str, str, tuple[tuple[str, ...], ...]], ...]] = tuple(
+    (action, "prefix", groups) for action, groups in _ENGLISH_TEMPLATES
+) + tuple((action, "suffix", groups) for action, groups in _HINGLISH_TEMPLATES)
+
+
+def _prefix_target(words: tuple[str, ...], candidates: tuple[tuple[str, ...], ...]) -> str | None:
+    """First candidate word-sequence that is a strict leading prefix of `words`.
+
+    Candidates are tried in order (mirrors regex alternation trying
+    alternatives left to right); the remaining words become the target. A
+    prefix that consumes every word (leaving no target) does not count, same
+    as `.+` requiring at least one character.
+    """
+    for prefix in candidates:
+        n = len(prefix)
+        if len(words) > n and words[:n] == prefix:
+            return " ".join(words[n:])
+    return None
+
+
+def _suffix_target(words: tuple[str, ...], candidates: tuple[tuple[str, ...], ...]) -> str | None:
+    """First candidate word-sequence that is a strict trailing suffix of `words`."""
+    for suffix in candidates:
+        n = len(suffix)
+        if len(words) > n and words[-n:] == suffix:
+            return " ".join(words[:-n])
+    return None
 
 #: Filler that may wrap a command without changing it. Removed once, exactly.
 _LEADING_VOCATIVE: Final[Pattern[str]] = re.compile(r"^(?:hey\s+|ok\s+)?bunnelby\s*[,:]?\s+")
@@ -261,11 +303,15 @@ def match_local_command(message: str) -> Mapping[str, str] | None:
     if _is_guarded(words):
         return None
 
-    for action, pattern in _TEMPLATES:
-        found = pattern.fullmatch(text)
-        if found is None:
+    for action, kind, candidates in _TEMPLATES:
+        target = (
+            _prefix_target(words, candidates)
+            if kind == "prefix"
+            else _suffix_target(words, candidates)
+        )
+        if target is None:
             continue
-        app_id = _resolved_app_id(found.group("target"))
+        app_id = _resolved_app_id(target)
         if app_id is None:
             # A recognised verb with an unresolvable target is a MISS, not a
             # refusal: "Open random.exe" and "Open Notepad and Calculator" both

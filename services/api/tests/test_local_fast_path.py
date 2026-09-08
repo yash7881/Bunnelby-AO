@@ -599,7 +599,7 @@ class ExistingPolicyOwnsAuthorityTests(unittest.TestCase):
 
 class ScopeTests(unittest.TestCase):
     def test_only_four_actions_are_reachable_locally(self) -> None:
-        reachable = {action for action, _ in local_fast_path._TEMPLATES}
+        reachable = {entry[0] for entry in local_fast_path._TEMPLATES}
         reachable.add("list_windows")
         self.assertEqual(
             reachable, {"open_app", "focus_app", "close_app", "list_windows"}

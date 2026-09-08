@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import sqlite3
 import threading
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final, Iterable, Sequence
+from typing import Final, Iterable, Mapping, Sequence
 
 from .models import FileSearchResult, IndexedFileInput, SearchMode
 
@@ -19,6 +20,26 @@ MAX_SNIPPET_CHARS: Final[int] = 500
 
 class FTS5UnavailableError(RuntimeError):
     """The index must not silently degrade to an unindexed content scan."""
+
+
+class JSONFunctionsUnavailableError(RuntimeError):
+    """The bulk-lookup queries below require SQLite's json_each table function."""
+
+
+#: Closed, literal SQL for the two tables `_rows_by_ids` is ever asked to read.
+#: The table name is chosen by dict lookup, never interpolated, so a caller
+#: cannot smuggle an arbitrary table/identifier into the query; an unknown key
+#: fails closed in `_rows_by_ids` before any SQL runs. The id list itself is a
+#: single bound parameter (a JSON array decoded by json_each), not string-built
+#: placeholders, so bulk lookup stays one query instead of one per id.
+_ROWS_BY_IDS_QUERIES: Final[Mapping[str, str]] = {
+    "files": "SELECT * FROM files WHERE id IN (SELECT value FROM json_each(?))",
+    "chunks": "SELECT * FROM chunks WHERE id IN (SELECT value FROM json_each(?))",
+}
+
+_ALL_FILE_ROWS_BY_ROOT_ALIAS: Final[str] = (
+    "SELECT * FROM files WHERE root_alias IN (SELECT value FROM json_each(?))"
+)
 
 
 def _literal_terms(value: str) -> tuple[str, ...]:
@@ -125,6 +146,13 @@ class FileIndexStore:
         except sqlite3.OperationalError as exc:
             raise FTS5UnavailableError(
                 "SQLite FTS5 with unicode61 and trigram tokenizers is required"
+            ) from exc
+
+        try:
+            self._connection.execute("SELECT value FROM json_each('[]')").fetchall()
+        except sqlite3.OperationalError as exc:
+            raise JSONFunctionsUnavailableError(
+                "SQLite json_each support is required for bulk id/root-alias lookups"
             ) from exc
 
         with self._connection:
@@ -325,8 +353,11 @@ class FileIndexStore:
     def all_file_rows(self, root_aliases: Sequence[str] | None = None) -> list[sqlite3.Row]:
         if not root_aliases:
             return list(self._connection.execute("SELECT * FROM files"))
-        placeholders = ",".join("?" for _ in root_aliases)
-        return list(self._connection.execute(f"SELECT * FROM files WHERE root_alias IN ({placeholders})", tuple(root_aliases)))
+        return list(
+            self._connection.execute(
+                _ALL_FILE_ROWS_BY_ROOT_ALIAS, (json.dumps(list(root_aliases)),)
+            )
+        )
 
     def chunk_row(self, chunk_id: int) -> sqlite3.Row | None:
         return self._connection.execute("SELECT * FROM chunks WHERE id=?", (chunk_id,)).fetchone()
@@ -337,11 +368,11 @@ class FileIndexStore:
     def _rows_by_ids(self, table: str, values: Sequence[int]) -> dict[int, sqlite3.Row]:
         if not values:
             return {}
+        query = _ROWS_BY_IDS_QUERIES.get(table)
+        if query is None:
+            raise ValueError(f"_rows_by_ids: unsupported table {table!r}")
         unique = tuple(dict.fromkeys(int(value) for value in values))
-        placeholders = ",".join("?" for _ in unique)
-        rows = self._connection.execute(
-            f"SELECT * FROM {table} WHERE id IN ({placeholders})", unique
-        ).fetchall()
+        rows = self._connection.execute(query, (json.dumps(unique),)).fetchall()
         return {int(row["id"]): row for row in rows}
 
     def search(
