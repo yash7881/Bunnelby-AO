@@ -1,7 +1,7 @@
 fastapi==0.141.1
 starlette==1.6.0
 uvicorn[standard]==0.35.0
-SQLAlchemy==2.0.43
+SQLAlchemy==2.0.52
 alembic==1.16.5
 pydantic==2.12.5
 google-genai==2.20.0
