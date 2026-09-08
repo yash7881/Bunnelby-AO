@@ -7,20 +7,11 @@ import HistoryDrawer from './components/HistoryDrawer';
 import ResponseSurface from './components/ResponseSurface';
 import { createAOVoicePlayer } from './audio/aoVoicePlayer';
 import { createRendererSpeechGuard } from './rendererSpeechGuard.mjs';
+import { createSessionId } from './sessionId.mjs';
 
 const API_BASE_URL = 'http://127.0.0.1:8000';
 const API_URL = `${API_BASE_URL}/chat`;
 
-// Part 10.2 Phase D: one identifier for this desktop chat session. Every /chat
-// request carries it so the backend scopes conversational memory to this
-// session and never treats an earlier conversation as the active topic.
-function createSessionId() {
-  const random =
-    globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
-      ? globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 16)
-      : Math.random().toString(16).slice(2).padEnd(16, '0').slice(0, 16);
-  return `sess-${random}`;
-}
 const PROCESSING_HINT_DELAY = 700;
 
 const APPROVAL_FIXTURE = {

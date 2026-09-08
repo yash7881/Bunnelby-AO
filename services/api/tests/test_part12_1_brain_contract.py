@@ -29,6 +29,7 @@ import unittest
 
 from services.api.app import tool_executor  # noqa: F401  (registers capabilities)
 from services.api.app.brain_agent import (
+    _extract_json_object,
     _parse_decision,
     decision_response_schema,
     tool_catalog_section,
@@ -448,6 +449,51 @@ class VerifierTransportTests(unittest.TestCase):
         blob = repr(verdict.observed) + verdict.evidence_text
         self.assertNotIn("SECRET-PROJECT", blob)
         self.assertEqual(verdict.observed["window_count"], 1)
+
+
+# --------------------------------------------------------------------------- #
+# _extract_json_object: markdown-fence stripping is now deterministic string
+# ops (strip/slice/casefold), not regex, to remove a polynomial-backtracking
+# CodeQL finding. These pin the exact behaviour the old regex produced.
+# --------------------------------------------------------------------------- #
+
+
+class ExtractJsonObjectTests(unittest.TestCase):
+    def test_plain_json_object(self) -> None:
+        self.assertEqual(_extract_json_object('{"a": 1}'), {"a": 1})
+
+    def test_json_fenced_object(self) -> None:
+        text = '```json\n{"a": 1}\n```'
+        self.assertEqual(_extract_json_object(text), {"a": 1})
+
+    def test_json_fenced_object_case_insensitive_label(self) -> None:
+        text = '```JSON\n{"a": 1}\n```'
+        self.assertEqual(_extract_json_object(text), {"a": 1})
+
+    def test_generic_fenced_object(self) -> None:
+        text = '```\n{"a": 1}\n```'
+        self.assertEqual(_extract_json_object(text), {"a": 1})
+
+    def test_fenced_object_with_extra_surrounding_text_still_recovers_via_brace_scan(self) -> None:
+        text = 'Here you go:\n```json\n{"a": 1}\n```\nThanks!'
+        self.assertEqual(_extract_json_object(text), {"a": 1})
+
+    def test_malformed_fenced_content_falls_through_to_none(self) -> None:
+        for text in ("```json\nnot json\n```", "```", "```json", "not json at all", ""):
+            with self.subTest(text=text):
+                self.assertIsNone(_extract_json_object(text))
+
+    def test_large_whitespace_and_fence_shaped_adversarial_input_does_not_hang(self) -> None:
+        """Regression for the ReDoS finding: this used to be O(n^2) via
+        `re.sub(r"\\s*```$", ...)` retried at every start position."""
+        import time
+
+        adversarial = "```json" + (" " * 200_000) + "not a fence close"
+        started = time.monotonic()
+        result = _extract_json_object(adversarial)
+        elapsed = time.monotonic() - started
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 1.0, "fence stripping must stay linear-time on adversarial input")
 
 
 if __name__ == "__main__":

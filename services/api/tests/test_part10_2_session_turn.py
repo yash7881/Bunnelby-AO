@@ -365,9 +365,21 @@ class VoiceRuntimeSessionTests(unittest.TestCase):
 class DesktopSessionWiringTests(unittest.TestCase):
     def test_app_jsx_sends_a_stable_session_id(self) -> None:
         app_jsx = (REPO_ROOT / "apps/desktop/src/App.jsx").read_text(encoding="utf-8")
-        self.assertIn("function createSessionId()", app_jsx)
+        # createSessionId lives in sessionId.mjs (CodeQL insecure-randomness
+        # fix); App.jsx imports it rather than defining it inline.
+        self.assertIn("import { createSessionId } from './sessionId.mjs';", app_jsx)
         self.assertIn("const sessionIdRef = useRef(createSessionId());", app_jsx)
         self.assertIn("session_id: sessionIdRef.current", app_jsx)
+
+    def test_session_id_generation_never_falls_back_to_predictable_randomness(self) -> None:
+        session_id_module = (REPO_ROOT / "apps/desktop/src/sessionId.mjs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("export function createSessionId()", session_id_module)
+        self.assertIn("randomUUID", session_id_module)
+        self.assertIn("getRandomValues", session_id_module)
+        self.assertNotIn("Math.random", session_id_module)
+        self.assertNotIn("Date.now", session_id_module)
 
 
 if __name__ == "__main__":
