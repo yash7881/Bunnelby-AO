@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -305,6 +306,10 @@ class VerificationEvidenceWritingTests(unittest.TestCase):
         self.assertEqual(audit_service.status_for_result(None), "unknown")
 
 
+@unittest.skipIf(
+    os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true",
+    "requires the user's migrated live ao.db; CI uses a disposable database",
+)
 class LiveDatabaseStateTests(unittest.TestCase):
     """Read-only assertions about the real ao.db after migrations 0005/0006.
 

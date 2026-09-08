@@ -39,6 +39,9 @@ jobs:
       - name: Deterministic secure-coding guard
         run: python scripts/security_guard.py
 
+      - name: Initialize CI database via Alembic migrations
+        run: python -m alembic -c database/alembic.ini upgrade head
+
       - name: Backend regression tests
         run: python -m unittest discover -s services/api/tests -v
 

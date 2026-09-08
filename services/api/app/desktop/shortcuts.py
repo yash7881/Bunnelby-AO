@@ -156,10 +156,14 @@ def send(shortcut: Shortcut) -> bool:
     obtain one is through `resolve()`, so an unreviewed combination cannot
     reach this function even by mistake.
     """
+    if not isinstance(shortcut, Shortcut):
+        raise ShortcutNotAllowedError("send() accepts allowlisted Shortcut objects only")
+    canonical = _BY_ID.get(shortcut.shortcut_id)
+    if canonical is None or shortcut != canonical:
+        raise ShortcutNotAllowedError("send() accepts allowlisted Shortcut objects only")
+
     if sys.platform != "win32":
         return False
-    if not isinstance(shortcut, Shortcut) or shortcut.shortcut_id not in _BY_ID:
-        raise ShortcutNotAllowedError("send() accepts allowlisted Shortcut objects only")
 
     import ctypes
     from ctypes import wintypes
