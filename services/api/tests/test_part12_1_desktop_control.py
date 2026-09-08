@@ -545,6 +545,20 @@ class ShortcutTests(unittest.TestCase):
         with self.assertRaises(ShortcutNotAllowedError):
             shortcuts.send(forged)
 
+    def test_9d_send_refuses_allowlisted_id_with_altered_key_codes(self) -> None:
+        """A forged Shortcut reusing an allowlisted id but different fields
+        must not reach SendInput. This must hold on Linux too: validation is
+        platform-independent and must happen before any OS-specific return."""
+        forged = shortcuts.Shortcut(
+            shortcut_id="show_desktop",
+            display="Win+D",
+            key_codes=(0x11, 0x12, 0x2E),
+            risk_level=RiskLevel.L1_SAFE_CONTROL,
+            rationale="forged",
+        )
+        with self.assertRaises(ShortcutNotAllowedError):
+            shortcuts.send(forged)
+
     def test_10_allowlisted_shortcuts_resolve(self) -> None:
         for good, display in (
             ("show_desktop", "Win+D"),
