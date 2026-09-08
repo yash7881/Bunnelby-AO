@@ -1,4 +1,8 @@
+import { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
+
+const ACTIVE_RUNTIME_MIC_STATES = new Set(['wake_detected', 'listening', 'follow_up']);
+const INACTIVE_RUNTIME_MIC_STATES = new Set(['transcribing', 'thinking', 'speaking', 'standby']);
 
 export default function CommandBar({
   inputRef,
@@ -11,6 +15,33 @@ export default function CommandBar({
   layoutMode,
   reducedMotion
 }) {
+  const [runtimeMicActive, setRuntimeMicActive] = useState(false);
+
+  // The microphone indicator reflects the authoritative persistent voice runtime,
+  // not only App's shared visual core state. Core state also represents thinking,
+  // speaking and renderer transitions, so coupling the mic highlight to it can
+  // make a real LISTENING/FOLLOW_UP state disappear visually even though the
+  // microphone runtime is still active.
+  useEffect(() => {
+    const bridge = window.bunnelbyVoice;
+    if (!bridge?.onEvent) return undefined;
+
+    return bridge.onEvent((event) => {
+      if (!event || typeof event !== 'object' || event.event !== 'state') return;
+
+      const runtimeState = String(event.state || '').toLowerCase();
+      if (ACTIVE_RUNTIME_MIC_STATES.has(runtimeState)) {
+        setRuntimeMicActive(true);
+        return;
+      }
+
+      if (INACTIVE_RUNTIME_MIC_STATES.has(runtimeState)) {
+        setRuntimeMicActive(false);
+      }
+    });
+  }, []);
+
+  const micActive = isListening || runtimeMicActive;
   const placeholder = isProcessing
     ? 'Processing…'
     : layoutMode === 'response'
@@ -27,11 +58,11 @@ export default function CommandBar({
       transition={{ duration: reducedMotion ? 0.01 : 0.24 }}
     >
       <button
-        className={`command-bar__icon command-bar__mic ${isListening ? 'is-active' : ''}`}
+        className={`command-bar__icon command-bar__mic ${micActive ? 'is-active' : ''}`}
         type="button"
         onClick={onMicrophone}
-        aria-label={isListening ? 'Stop listening preview' : 'Preview listening state'}
-        aria-pressed={isListening}
+        aria-label={micActive ? 'Stop listening preview' : 'Preview listening state'}
+        aria-pressed={micActive}
         disabled={isProcessing}
         title="Voice wake is active: say Hey Bunnelby or Hello Bunnelby"
       >
