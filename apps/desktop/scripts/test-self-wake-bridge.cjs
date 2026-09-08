@@ -6,7 +6,8 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
-  encodeRendererSpeakingControl
+  encodeRendererSpeakingControl,
+  normalizeVoiceEventForRenderer
 } = require('../voice-control-protocol.cjs');
 
 test('renderer speaking control is strict newline-delimited JSON', () => {
@@ -19,6 +20,30 @@ test('renderer speaking control is strict newline-delimited JSON', () => {
     '{"type":"renderer_speaking","speaking":false}\n'
   );
   assert.throws(() => encodeRendererSpeakingControl('true'), TypeError);
+});
+
+test('unclear STT runtime error becomes a visible clarification and not a tool result', () => {
+  assert.deepEqual(
+    normalizeVoiceEventForRenderer({
+      event: 'runtime_error',
+      message: 'conversation STT returned no text'
+    }),
+    {
+      event: 'assistant_response',
+      reply: "I didn't catch that clearly. Say 'Hey Bunnelby' and try again.",
+      spoken_reply: "I didn't catch that clearly. Say Hey Bunnelby and try again.",
+      spoken_language: 'en',
+      action_type: 'clarification_required'
+    }
+  );
+});
+
+test('unrelated runtime errors are not disguised as assistant answers', () => {
+  const event = {
+    event: 'runtime_error',
+    message: 'conversation STT failed: model unavailable'
+  };
+  assert.equal(normalizeVoiceEventForRenderer(event), event);
 });
 
 test('renderer speech guard blocks during playback and speaker-tail cooldown', async () => {
@@ -63,6 +88,7 @@ test('desktop wiring pre-arms suppression before WebAudio playback starts', () =
     /notifySpeaking\(true\);\s*await wait\(SELF_WAKE_ARM_DELAY_MS\);[\s\S]*sourceNode\.start\(\);/
   );
   assert.match(preloadSource, /setRendererSpeaking\(isSpeaking\)/);
+  assert.match(preloadSource, /normalizeVoiceEventForRenderer\(payload\)/);
   assert.match(electronSource, /--voice-control-stdin/);
   assert.match(electronSource, /stdio:\s*\['pipe',\s*'pipe',\s*'pipe'\]/);
 });
