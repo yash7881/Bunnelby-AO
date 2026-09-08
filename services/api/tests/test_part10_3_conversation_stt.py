@@ -28,7 +28,10 @@ class ConversationSTTTests(unittest.TestCase):
         samples = np.zeros(16_000 * 9, dtype=np.float32)
 
         with (
-            patch.dict(os.environ, {"STT_HOTWORDS": ""}),
+            patch.dict(
+                os.environ,
+                {"STT_CONTEXT_BIAS_ENABLED": "false", "STT_HOTWORDS": ""},
+            ),
             patch.object(stt_service, "_load_model", return_value=model),
             patch("services.api.app.stt_service.tempfile.NamedTemporaryFile") as named_temp,
         ):
@@ -112,7 +115,7 @@ class ConversationSTTTests(unittest.TestCase):
         self.assertEqual(result.text, "ready")
         self.assertIs(stt_service._model, model)
 
-    def test_runtime_profile_reports_effective_environment(self) -> None:
+    def test_runtime_profile_reports_opted_in_environment(self) -> None:
         with patch.dict(
             os.environ,
             {
@@ -120,6 +123,7 @@ class ConversationSTTTests(unittest.TestCase):
                 "STT_DEVICE": "cuda",
                 "STT_COMPUTE_TYPE": "int8_float16",
                 "STT_BEAM_SIZE": "3",
+                "STT_CONTEXT_BIAS_ENABLED": "true",
                 "STT_HOTWORDS": "Bunnelby   Gmail calendar",
             },
         ):
@@ -130,6 +134,30 @@ class ConversationSTTTests(unittest.TestCase):
         self.assertEqual(profile.beam_size, 3)
         self.assertEqual(profile.hotwords, "Bunnelby Gmail calendar")
 
+    def test_stale_domain_hotwords_are_inert_without_explicit_opt_in(self) -> None:
+        model = Mock()
+        model.transcribe.return_value = (
+            iter([SimpleNamespace(text=" open notepad ")]),
+            SimpleNamespace(language="en", language_probability=0.95, duration=1.0),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "STT_CONTEXT_BIAS_ENABLED": "false",
+                    "STT_HOTWORDS": "Bunnelby Gmail calendar latest unread email emails",
+                    "STT_HOTWORDS_HI": "कल कैलेंडर चेक करो ईमेल जीमेल आज कल परसों",
+                },
+            ),
+            patch.object(stt_service, "_load_model", return_value=model),
+        ):
+            result = stt_service.transcribe_samples(np.zeros(16_000, dtype=np.float32))
+
+        self.assertEqual(result.text, "open notepad")
+        self.assertIsNone(stt_service.stt_hotwords())
+        self.assertIsNone(stt_service.stt_hindi_hotwords())
+        self.assertIsNone(model.transcribe.call_args.kwargs["hotwords"])
+
     def test_optional_hotwords_are_decoder_context_not_transcript_rewriting(self) -> None:
         model = Mock()
         model.transcribe.return_value = (
@@ -137,7 +165,13 @@ class ConversationSTTTests(unittest.TestCase):
             SimpleNamespace(language="en", language_probability=1.0, duration=1.0),
         )
         with (
-            patch.dict(os.environ, {"STT_HOTWORDS": "Gmail calendar unread"}),
+            patch.dict(
+                os.environ,
+                {
+                    "STT_CONTEXT_BIAS_ENABLED": "true",
+                    "STT_HOTWORDS": "Gmail calendar unread",
+                },
+            ),
             patch.object(stt_service, "_load_model", return_value=model),
         ):
             result = stt_service.transcribe_samples(np.zeros(16_000, dtype=np.float32))
@@ -152,7 +186,13 @@ class ConversationSTTTests(unittest.TestCase):
             SimpleNamespace(language="hi", language_probability=1.0, duration=1.0),
         )
         with (
-            patch.dict(os.environ, {"STT_HOTWORDS": "English context"}),
+            patch.dict(
+                os.environ,
+                {
+                    "STT_CONTEXT_BIAS_ENABLED": "false",
+                    "STT_HOTWORDS": "English context",
+                },
+            ),
             patch.object(stt_service, "_load_model", return_value=model),
         ):
             stt_service.transcribe_samples(
@@ -162,6 +202,7 @@ class ConversationSTTTests(unittest.TestCase):
             )
 
         self.assertEqual(model.transcribe.call_args.kwargs["hotwords"], "कल कैलेंडर")
+        self.assertIsNone(stt_service.stt_hotwords())
 
 
 if __name__ == "__main__":
