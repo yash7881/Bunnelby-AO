@@ -223,11 +223,36 @@ def _suffix_target(words: tuple[str, ...], candidates: tuple[tuple[str, ...], ..
     return None
 
 #: Filler that may wrap a command without changing it. Removed once, exactly.
-_LEADING_VOCATIVE: Final[Pattern[str]] = re.compile(r"^(?:hey\s+|ok\s+)?bunnelby\s*[,:]?\s+")
-_LEADING_PLEASE: Final[Pattern[str]] = re.compile(r"^please\s+")
-_TRAILING_PLEASE: Final[Pattern[str]] = re.compile(r"\s+please$")
+#: normalize() collapses all whitespace before these checks, so the reviewed
+#: wrappers can be stripped with fixed string operations rather than regexes.
+_VOCATIVE_LEADS: Final[tuple[str, ...]] = ("hey ", "ok ")
+_BUNNELBY_PREFIXES: Final[tuple[str, ...]] = (
+    "bunnelby , ",
+    "bunnelby : ",
+    "bunnelby, ",
+    "bunnelby: ",
+    "bunnelby ",
+)
+_LEADING_PLEASE_PREFIX: Final[str] = "please "
+_TRAILING_PLEASE_SUFFIX: Final[str] = " please"
 _TERMINAL_PUNCTUATION: Final[str] = ".!?"
 _APOSTROPHES: Final[str] = "'\u2019\u02bc"
+
+
+def _strip_leading_vocative(text: str) -> str:
+    """Remove one reviewed Bunnelby vocative, preserving the old grammar."""
+    original = text
+    candidate = text
+    for lead in _VOCATIVE_LEADS:
+        if candidate.startswith(lead):
+            candidate = candidate[len(lead):]
+            break
+
+    for prefix in _BUNNELBY_PREFIXES:
+        if candidate.startswith(prefix):
+            return candidate[len(prefix):]
+
+    return original
 
 
 def normalize(message: str) -> str:
@@ -241,9 +266,11 @@ def normalize(message: str) -> str:
     """
     text = " ".join(str(message or "").strip().casefold().split())
     text = text.rstrip(_TERMINAL_PUNCTUATION).strip()
-    text = _LEADING_VOCATIVE.sub("", text, count=1)
-    text = _LEADING_PLEASE.sub("", text, count=1)
-    text = _TRAILING_PLEASE.sub("", text, count=1)
+    text = _strip_leading_vocative(text)
+    if text.startswith(_LEADING_PLEASE_PREFIX):
+        text = text[len(_LEADING_PLEASE_PREFIX):]
+    if text.endswith(_TRAILING_PLEASE_SUFFIX):
+        text = text[:-len(_TRAILING_PLEASE_SUFFIX)]
     return " ".join(text.split())
 
 
