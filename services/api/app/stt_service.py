@@ -19,12 +19,23 @@ DEFAULT_STT_DEVICE = "cpu"
 DEFAULT_STT_COMPUTE_TYPE = "int8"
 DEFAULT_STT_CPU_THREADS = 4
 DEFAULT_STT_BEAM_SIZE = 5
+DEFAULT_STT_CONTEXT_BIAS_ENABLED = False
 DEFAULT_STT_HOTWORDS = ""
-DEFAULT_STT_HINDI_HOTWORDS = "कल कैलेंडर चेक करो ईमेल जीमेल आज कल परसों"
+DEFAULT_STT_HINDI_HOTWORDS = ""
 DEFAULT_STT_MAX_AUDIO_BYTES = 12 * 1024 * 1024
 DEFAULT_STT_MAX_SAMPLE_SECONDS = 120.0
 STT_SAMPLE_RATE = 16_000
 SUPPORTED_LANGUAGE_HINTS = {"auto", "en", "hi"}
+
+# Voice transcripts are allowed to be imperfect, especially for Hinglish, but a
+# weak short-language guess must never become authority to execute a real tool.
+# These thresholds are deliberately conservative: language_probability is only
+# a language-ID signal, so English/Hindi are never rejected on that value alone.
+VOICE_PRIMARY_LANGUAGES = frozenset({"en", "hi"})
+MIN_UNSUPPORTED_LANGUAGE_CONFIDENCE = 0.70
+MIN_ACCEPTABLE_AVG_LOGPROB = -1.20
+HIGH_NO_SPEECH_PROBABILITY = 0.60
+NO_SPEECH_AVG_LOGPROB = -0.80
 
 _CONTENT_TYPE_SUFFIXES = {
     "audio/wav": ".wav",
@@ -65,6 +76,11 @@ class TranscriptionResult:
     language: str
     language_probability: float
     duration_seconds: float
+    # Decoder evidence is optional for backwards compatibility with callers and
+    # tests that construct TranscriptionResult directly. The live Whisper path
+    # populates these whenever the model supplies segment metadata.
+    average_log_probability: float | None = None
+    max_no_speech_probability: float | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +107,16 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def stt_enabled() -> bool:
     return _env_bool("STT_ENABLED", True)
+
+
+def stt_context_bias_enabled() -> bool:
+    """Whether optional decoder hotwords may influence recognition.
+
+    Bunnelby is a general assistant, so domain vocabulary is opt-in rather than
+    a global default. This also makes stale Gmail/Calendar hotword entries in an
+    old local .env inert unless the user deliberately enables decoder bias.
+    """
+    return _env_bool("STT_CONTEXT_BIAS_ENABLED", DEFAULT_STT_CONTEXT_BIAS_ENABLED)
 
 
 def stt_model_name() -> str:
@@ -124,16 +150,21 @@ def stt_beam_size() -> int:
 
 
 def stt_hotwords() -> str | None:
-    """Return bounded, optional decoder context without rewriting any transcript."""
+    """Return bounded optional decoder context only when explicitly enabled."""
+    if not stt_context_bias_enabled():
+        return None
     normalized = " ".join(os.getenv("STT_HOTWORDS", DEFAULT_STT_HOTWORDS).split())
     return normalized[:300] or None
 
 
-def stt_hindi_hotwords() -> str:
+def stt_hindi_hotwords() -> str | None:
+    """Optional Hindi rescue context; neutral/empty by default."""
+    if not stt_context_bias_enabled():
+        return None
     normalized = " ".join(
         os.getenv("STT_HOTWORDS_HI", DEFAULT_STT_HINDI_HOTWORDS).split()
     )
-    return (normalized[:300] or DEFAULT_STT_HINDI_HOTWORDS)
+    return normalized[:300] or None
 
 
 def stt_max_audio_bytes() -> int:
@@ -290,16 +321,108 @@ def _normalize_text(parts: list[str]) -> str:
     return " ".join(part.strip() for part in parts if part and part.strip()).strip()
 
 
+def _finite_float(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if np.isfinite(parsed) else None
+
+
 def _result_from_transcription(segments: Any, info: Any, language_hint: str) -> TranscriptionResult:
-    text = _normalize_text([str(segment.text) for segment in segments])
+    segment_list = list(segments)
+    text = _normalize_text([str(segment.text) for segment in segment_list])
     detected_language = str(getattr(info, "language", "") or language_hint or "auto")
     probability = float(getattr(info, "language_probability", 0.0) or 0.0)
     duration = float(getattr(info, "duration", 0.0) or 0.0)
+
+    log_probabilities = [
+        value
+        for segment in segment_list
+        if (value := _finite_float(getattr(segment, "avg_logprob", None))) is not None
+    ]
+    no_speech_probabilities = [
+        value
+        for segment in segment_list
+        if (value := _finite_float(getattr(segment, "no_speech_prob", None))) is not None
+    ]
+
+    average_log_probability = (
+        sum(log_probabilities) / len(log_probabilities)
+        if log_probabilities
+        else None
+    )
+    max_no_speech_probability = (
+        max(0.0, min(max(no_speech_probabilities), 1.0))
+        if no_speech_probabilities
+        else None
+    )
+
     return TranscriptionResult(
         text=text,
         language=detected_language,
         language_probability=max(0.0, min(probability, 1.0)),
         duration_seconds=max(0.0, duration),
+        average_log_probability=average_log_probability,
+        max_no_speech_probability=max_no_speech_probability,
+    )
+
+
+def microphone_transcription_is_trustworthy(
+    result: TranscriptionResult,
+    *,
+    language_hint: str = "auto",
+) -> bool:
+    """Fail closed on weak microphone evidence before text can reach /chat.
+
+    The policy intentionally does NOT use language_probability as a generic
+    transcript-confidence score: Hinglish often has ambiguous language ID. A
+    low-confidence *unsupported* language guess is different -- e.g. a short
+    English/Hinglish command misdetected as Malayalam -- and triggers the
+    runtime's existing bounded English/Hindi rescue instead of being executed.
+    """
+    if not str(result.text or "").strip():
+        return False
+
+    average_log_probability = result.average_log_probability
+    max_no_speech_probability = result.max_no_speech_probability
+
+    if (
+        average_log_probability is not None
+        and average_log_probability < MIN_ACCEPTABLE_AVG_LOGPROB
+    ):
+        return False
+
+    if (
+        average_log_probability is not None
+        and max_no_speech_probability is not None
+        and average_log_probability < NO_SPEECH_AVG_LOGPROB
+        and max_no_speech_probability > HIGH_NO_SPEECH_PROBABILITY
+    ):
+        return False
+
+    normalized_hint = _validate_language_hint(language_hint)
+    if normalized_hint == "auto":
+        detected = str(result.language or "").strip().casefold()
+        if (
+            detected
+            and detected not in VOICE_PRIMARY_LANGUAGES
+            and detected != "auto"
+            and result.language_probability < MIN_UNSUPPORTED_LANGUAGE_CONFIDENCE
+        ):
+            return False
+
+    return True
+
+
+def _with_empty_text(result: TranscriptionResult) -> TranscriptionResult:
+    return TranscriptionResult(
+        text="",
+        language=result.language,
+        language_probability=result.language_probability,
+        duration_seconds=result.duration_seconds,
+        average_log_probability=result.average_log_probability,
+        max_no_speech_probability=result.max_no_speech_probability,
     )
 
 
@@ -341,12 +464,16 @@ def transcribe_samples(
     language: str | None = "auto",
     hotwords_override: str | None = None,
 ) -> TranscriptionResult:
-    """Transcribe a microphone utterance directly from RAM.
+    """Transcribe one microphone utterance directly from RAM.
 
     This path is intended for Bunnelby's post-wake conversation runtime. The waveform is
     passed to faster-whisper as a numpy array, so no temporary audio file is created.
     External conversation VAD should already have isolated the user's utterance; a second
     Whisper VAD pass is therefore disabled to avoid trimming words at the boundaries.
+
+    A weak automatic-language/acoustic result is returned with empty text. The persistent
+    runtime already treats empty text as non-authoritative, performs its bounded rescue
+    passes, and refuses to dispatch anything to /chat if no trustworthy candidate exists.
     """
     if not stt_enabled():
         raise STTDisabledError("Local speech recognition is disabled.")
@@ -363,12 +490,24 @@ def transcribe_samples(
         raise STTAudioError("Audio samples contain invalid values.")
 
     language_hint = _validate_language_hint(language)
-    return _transcribe_source(
+    result = _transcribe_source(
         np.ascontiguousarray(waveform),
         language_hint=language_hint,
         vad_filter=False,
         hotwords_override=hotwords_override,
     )
+    if microphone_transcription_is_trustworthy(result, language_hint=language_hint):
+        return result
+
+    logger.warning(
+        "Rejected uncertain microphone transcript before dispatch: "
+        "language=%s language_probability=%.3f avg_logprob=%s no_speech=%s",
+        result.language,
+        result.language_probability,
+        result.average_log_probability,
+        result.max_no_speech_probability,
+    )
+    return _with_empty_text(result)
 
 
 def transcribe_audio(
@@ -380,7 +519,9 @@ def transcribe_audio(
     """Transcribe uploaded local audio and delete the temporary file immediately.
 
     Browser-originated formats such as WebM still require decode-from-file compatibility.
-    The microphone runtime uses transcribe_samples() instead and stays RAM-only.
+    The microphone runtime uses transcribe_samples() instead and stays RAM-only. Uploaded
+    STT remains a transcription API; the stricter execution trust gate applies only to the
+    persistent microphone-command path.
     """
     if not stt_enabled():
         raise STTDisabledError("Local speech recognition is disabled.")
