@@ -90,11 +90,91 @@ Behavior rules:
   dramatic wording.
 """.strip()
 
-_SIMPLE_GREETING_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^\s*(?:hi|hello|hey|hey\s+(?:ao|bunnelby)|hello\s+(?:ao|bunnelby)|hi\s+(?:ao|bunnelby)|good\s+morning|"
-    r"good\s+afternoon|good\s+evening|good\s+night)\s*[!.?]*\s*$",
-    re.IGNORECASE,
+_SIMPLE_GREETING_FORMS: Final[frozenset[tuple[str, ...]]] = frozenset(
+    {
+        ("hi",),
+        ("hello",),
+        ("hey",),
+        ("hey", "ao"),
+        ("hey", "bunnelby"),
+        ("hello", "ao"),
+        ("hello", "bunnelby"),
+        ("hi", "ao"),
+        ("hi", "bunnelby"),
+        ("good", "morning"),
+        ("good", "afternoon"),
+        ("good", "evening"),
+        ("good", "night"),
+    }
 )
+_GREETING_TERMINAL_PUNCTUATION: Final[str] = ".!?"
+
+
+def _is_simple_greeting(user_message: str) -> bool:
+    """Deterministically recognise the closed greeting vocabulary.
+
+    This intentionally avoids a regex on uncontrolled user input. The old
+    anchored expression combined repeated whitespace with overlapping
+    alternatives, which CodeQL correctly identified as a polynomial
+    backtracking path. Normalising the bounded greeting shape to words is
+    linear and preserves the accepted language exactly.
+    """
+    text = str(user_message or "").strip().casefold()
+    if not text:
+        return False
+
+    punctuation_start = len(text)
+    while (
+        punctuation_start > 0
+        and text[punctuation_start - 1] in _GREETING_TERMINAL_PUNCTUATION
+    ):
+        punctuation_start -= 1
+
+    core = text[:punctuation_start].rstrip()
+    return tuple(core.split()) in _SIMPLE_GREETING_FORMS
+
+
+class _SimpleGreetingMatch:
+    """Minimal match object preserving the legacy truthy/None contract."""
+
+    __slots__ = ("string",)
+
+    def __init__(self, string: str) -> None:
+        self.string = string
+
+    def group(self, group: int = 0) -> str:
+        if group != 0:
+            raise IndexError("no such group")
+        return self.string
+
+    def start(self, group: int = 0) -> int:
+        if group != 0:
+            raise IndexError("no such group")
+        return 0
+
+    def end(self, group: int = 0) -> int:
+        if group != 0:
+            raise IndexError("no such group")
+        return len(self.string)
+
+    def span(self, group: int = 0) -> tuple[int, int]:
+        return (self.start(group), self.end(group))
+
+
+class _SimpleGreetingMatcher:
+    """Compatibility wrapper for legacy `.match()`/`.fullmatch()` call sites."""
+
+    __slots__ = ()
+
+    def match(self, value: str) -> _SimpleGreetingMatch | None:
+        text = str(value or "")
+        return _SimpleGreetingMatch(text) if _is_simple_greeting(text) else None
+
+    def fullmatch(self, value: str) -> _SimpleGreetingMatch | None:
+        return self.match(value)
+
+
+_SIMPLE_GREETING_PATTERN: Final[_SimpleGreetingMatcher] = _SimpleGreetingMatcher()
 
 def _time_appropriate_greeting() -> str:
     hour = datetime.now().astimezone().hour
@@ -130,8 +210,9 @@ def _general_chat_inference_profile(user_message: str) -> str:
     return "fast"
 
 # Canonical public names for new code.
-SIMPLE_GREETING_PATTERN: Final[re.Pattern[str]] = _SIMPLE_GREETING_PATTERN
+SIMPLE_GREETING_PATTERN: Final[_SimpleGreetingMatcher] = _SIMPLE_GREETING_PATTERN
 COMPLEX_GENERAL_CHAT_PATTERN: Final[re.Pattern[str]] = _COMPLEX_GENERAL_CHAT_PATTERN
+is_simple_greeting = _is_simple_greeting
 time_appropriate_greeting = _time_appropriate_greeting
 general_chat_inference_profile = _general_chat_inference_profile
 
@@ -139,10 +220,12 @@ __all__ = [
     "AO_CHAT_SYSTEM_INSTRUCTION",
     "SIMPLE_GREETING_PATTERN",
     "COMPLEX_GENERAL_CHAT_PATTERN",
+    "is_simple_greeting",
     "time_appropriate_greeting",
     "general_chat_inference_profile",
     # Legacy aliases retained for existing call sites and tests.
     "_SIMPLE_GREETING_PATTERN",
+    "_is_simple_greeting",
     "_COMPLEX_GENERAL_CHAT_PATTERN",
     "_time_appropriate_greeting",
     "_general_chat_inference_profile",
