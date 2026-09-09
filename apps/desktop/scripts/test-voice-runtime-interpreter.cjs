@@ -14,8 +14,10 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  LOCAL_CONFIG_FILENAME,
   REQUIRED_RUNTIME_MODULES,
   INTERPRETER_PROBE_SOURCE,
+  readLocalInterpreter,
   resolveVoiceRuntime,
   verifyVoiceRuntimeInterpreter,
   describeInterpreterFailure
@@ -47,15 +49,45 @@ test('blank BUNNELBY_PYTHON is ignored rather than used as an executable', () =>
   assert.notEqual(resolved.pythonSource, 'BUNNELBY_PYTHON');
 });
 
-test('the PATH fallback is labelled as a fallback, not silently trusted', () => {
+test('there is NO silent PATH fallback', () => {
   // This repository has no .venv, which is exactly the failing configuration.
-  const resolved = resolveVoiceRuntime(APP_DIR, {});
-  assert.equal(resolved.pythonExecutable, 'python');
-  assert.equal(
-    resolved.pythonSource,
-    'PATH fallback',
-    'the guess must be identifiable so a failure can name it'
-  );
+  // Guessing `python` here is what silently disabled voice in the field.
+  const resolved = resolveVoiceRuntime(APP_DIR, {}, () => {
+    throw new Error('ENOENT');
+  });
+  assert.equal(resolved.pythonExecutable, null);
+  assert.equal(resolved.pythonSource, 'unresolved');
+});
+
+test('a durable local config supplies the interpreter without an env var', () => {
+  const reader = () => JSON.stringify({ pythonPath: 'D:\\envs\\bunnelby\\python.exe' });
+  const resolved = resolveVoiceRuntime(APP_DIR, {}, reader);
+  assert.equal(resolved.pythonExecutable, 'D:\\envs\\bunnelby\\python.exe');
+  assert.equal(resolved.pythonSource, LOCAL_CONFIG_FILENAME);
+});
+
+test('a malformed or empty local config is ignored, not fatal', () => {
+  for (const raw of ['{ not json', '{}', '{"pythonPath": "   "}']) {
+    const resolved = resolveVoiceRuntime(APP_DIR, {}, () => raw);
+    assert.equal(resolved.pythonExecutable, null, raw);
+  }
+  assert.equal(readLocalInterpreter('C:\\nope', () => { throw new Error('ENOENT'); }), null);
+});
+
+test('an unconfigured interpreter is refused before any spawn', () => {
+  const result = verifyVoiceRuntimeInterpreter(null, () => {
+    throw new Error('must not be called');
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /was not configured/);
+});
+
+test('the unconfigured failure message still explains the remedy', () => {
+  const message = describeInterpreterFailure(null, 'unresolved', 'was not configured', 'C:\\repo');
+  assert.match(message, /No voice runtime interpreter is configured/);
+  assert.match(message, /\.venv/);
+  assert.match(message, /pythonPath/);
+  assert.match(message, /Wake detection is disabled/);
 });
 
 test('the runtime script path is resolved from the repository root', () => {

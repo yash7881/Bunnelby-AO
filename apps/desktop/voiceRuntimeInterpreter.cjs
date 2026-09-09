@@ -2,13 +2,17 @@
 
 // Which Python runs the persistent voice runtime, and whether it actually can.
 //
-// WHY THIS EXISTS. `resolveVoiceRuntime` used to end in
+// WHY THIS EXISTS. Resolution used to end in
 // `fs.existsSync(venvPython) ? venvPython : 'python'`, which quietly assumes a
 // bare `python` on PATH is interchangeable with the project interpreter. On a
 // checkout without a .venv it is not: `python` resolved to a global 3.10 with
 // none of the voice dependencies, so the child died on its first line
 // (`ModuleNotFoundError: No module named 'numpy'`) before the microphone was
 // ever opened. The wake word then did nothing, with no error in the UI.
+//
+// There is now NO PATH fallback. An interpreter is either explicitly chosen,
+// or the repository's own, or the launch fails loudly with the remedy. A guess
+// that silently disables voice is worse than a refusal that explains itself.
 //
 // Kept out of electron.cjs so it is unit-testable without booting Electron,
 // exactly as voice-control-protocol.cjs is.
@@ -26,6 +30,10 @@ const REQUIRED_RUNTIME_MODULES = Object.freeze([
   'faster_whisper'
 ]);
 
+// Durable per-machine override, git-ignored, so a working interpreter is
+// configured ONCE instead of exported into the shell on every launch.
+const LOCAL_CONFIG_FILENAME = '.bunnelby.local.json';
+
 // find_spec locates a module without executing it, so the check stays fast
 // enough to run once at startup.
 const INTERPRETER_PROBE_SOURCE = [
@@ -40,14 +48,32 @@ const INTERPRETER_PROBE_SOURCE = [
   'sys.stdout.write(",".join(missing))'
 ].join('\n');
 
+/** Read `pythonPath` from the git-ignored local config, if present and sane. */
+function readLocalInterpreter(repoRoot, reader = fs.readFileSync) {
+  const configPath = path.join(repoRoot, LOCAL_CONFIG_FILENAME);
+  let raw;
+  try {
+    raw = reader(configPath, 'utf-8');
+  } catch {
+    return null; // absent is the normal case, not an error
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    const candidate = String(parsed?.pythonPath || '').trim();
+    return candidate || null;
+  } catch {
+    return null; // a malformed file must not crash startup
+  }
+}
+
 /**
  * Decide which interpreter to use, and record how that decision was made.
  *
- * Order: explicit BUNNELBY_PYTHON, then the repository's own .venv, then
- * whatever `python` is on PATH. The last is a guess and is labelled as one so
- * a failure can name it.
+ * Order: explicit BUNNELBY_PYTHON, the repository's own .venv, then the
+ * durable local config. If none resolves there is deliberately no fallback --
+ * `pythonExecutable` is null and the caller reports why.
  */
-function resolveVoiceRuntime(appDir, env = process.env) {
+function resolveVoiceRuntime(appDir, env = process.env, reader = fs.readFileSync) {
   const repoRoot = path.resolve(appDir, '..', '..');
   const runtimeScript = path.join(
     repoRoot,
@@ -55,33 +81,24 @@ function resolveVoiceRuntime(appDir, env = process.env) {
     'wakeword',
     'wake_conversation_runtime.py'
   );
+  const base = { repoRoot, runtimeScript };
 
   const configuredPython = String(env.BUNNELBY_PYTHON || '').trim();
   if (configuredPython) {
-    return {
-      repoRoot,
-      runtimeScript,
-      pythonExecutable: configuredPython,
-      pythonSource: 'BUNNELBY_PYTHON'
-    };
+    return { ...base, pythonExecutable: configuredPython, pythonSource: 'BUNNELBY_PYTHON' };
   }
 
   const venvPython = path.join(repoRoot, '.venv', 'Scripts', 'python.exe');
   if (fs.existsSync(venvPython)) {
-    return {
-      repoRoot,
-      runtimeScript,
-      pythonExecutable: venvPython,
-      pythonSource: 'repo .venv'
-    };
+    return { ...base, pythonExecutable: venvPython, pythonSource: 'repo .venv' };
   }
 
-  return {
-    repoRoot,
-    runtimeScript,
-    pythonExecutable: 'python',
-    pythonSource: 'PATH fallback'
-  };
+  const localPython = readLocalInterpreter(repoRoot, reader);
+  if (localPython) {
+    return { ...base, pythonExecutable: localPython, pythonSource: LOCAL_CONFIG_FILENAME };
+  }
+
+  return { ...base, pythonExecutable: null, pythonSource: 'unresolved' };
 }
 
 /**
@@ -91,6 +108,10 @@ function resolveVoiceRuntime(appDir, env = process.env) {
  * check must produce a clear message, not crash the main process.
  */
 function verifyVoiceRuntimeInterpreter(pythonExecutable, runner = spawnSync) {
+  if (!pythonExecutable) {
+    return { ok: false, reason: 'was not configured' };
+  }
+
   let probe;
   try {
     probe = runner(
@@ -116,9 +137,7 @@ function verifyVoiceRuntimeInterpreter(pythonExecutable, runner = spawnSync) {
       .join(' | ');
     return {
       ok: false,
-      reason: `failed its dependency check (exit ${probe.status})${
-        stderr ? `: ${stderr}` : ''
-      }`
+      reason: `failed its dependency check (exit ${probe.status})${stderr ? `: ${stderr}` : ''}`
     };
   }
 
@@ -139,18 +158,29 @@ function verifyVoiceRuntimeInterpreter(pythonExecutable, runner = spawnSync) {
   return { ok: true };
 }
 
-/** The message shown when the chosen interpreter cannot run the runtime. */
-function describeInterpreterFailure(pythonExecutable, pythonSource, reason) {
+/** The message shown when no usable interpreter is available. */
+function describeInterpreterFailure(pythonExecutable, pythonSource, reason, repoRoot = '') {
+  const subject = pythonExecutable
+    ? `Voice runtime interpreter "${pythonExecutable}" (${pythonSource}) ${reason}`
+    : 'No voice runtime interpreter is configured';
+
+  const localConfig = repoRoot
+    ? path.join(repoRoot, LOCAL_CONFIG_FILENAME)
+    : LOCAL_CONFIG_FILENAME;
+
   return (
-    `Voice runtime interpreter "${pythonExecutable}" (${pythonSource}) ${reason}. ` +
-    'Wake detection is disabled. Set BUNNELBY_PYTHON to an interpreter that has ' +
-    'the voice dependencies installed, or create a .venv in the repository root.'
+    `${subject}. Wake detection is disabled. Fix it once by creating a .venv in ` +
+    `the repository root and installing services/api/requirements.txt, or by ` +
+    `writing {"pythonPath": "<full path to python.exe>"} into ${localConfig}. ` +
+    'BUNNELBY_PYTHON also works for a single session.'
   );
 }
 
 module.exports = {
+  LOCAL_CONFIG_FILENAME,
   REQUIRED_RUNTIME_MODULES,
   INTERPRETER_PROBE_SOURCE,
+  readLocalInterpreter,
   resolveVoiceRuntime,
   verifyVoiceRuntimeInterpreter,
   describeInterpreterFailure

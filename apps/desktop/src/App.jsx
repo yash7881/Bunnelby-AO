@@ -125,6 +125,10 @@ export default function App() {
   const [voiceRuntimeState, setVoiceRuntimeState] = useState(
     INITIAL_VOICE_RUNTIME_STATE
   );
+  // True when there is no working voice subsystem at all. The mic control
+  // must never advertise "say Hey Bunnelby" while the Python runtime is
+  // dead or was never able to start.
+  const [voiceUnavailable, setVoiceUnavailable] = useState(false);
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState(initialSetup.messages);
   const [activeResponse, setActiveResponse] = useState(initialSetup.response);
@@ -213,6 +217,16 @@ export default function App() {
 
       if (eventType === 'runtime_ready') {
         console.info('Bunnelby persistent voice runtime ready', event);
+        setVoiceUnavailable(false);
+        return;
+      }
+
+      if (eventType === 'voice_runtime_started') {
+        console.info(
+          `Bunnelby voice runtime started pid=${event.pid} ` +
+            `interpreter_source=${event.interpreter_source}`
+        );
+        setVoiceUnavailable(false);
         return;
       }
 
@@ -344,6 +358,7 @@ export default function App() {
         console.error('Bunnelby voice runtime:', event.message || eventType);
         setSending(false);
         setCoreState('idle');
+        if (event.voice_unavailable === true) setVoiceUnavailable(true);
       }
     });
   }, []);
@@ -628,6 +643,7 @@ export default function App() {
         onSubmit={handleSubmit}
         onMicrophone={toggleListeningPreview}
         micActive={isMicActive(voiceRuntimeState)}
+        voiceUnavailable={voiceUnavailable}
         isProcessing={sending}
         layoutMode={layoutMode}
         reducedMotion={reducedMotion}

@@ -12,6 +12,7 @@ export default function CommandBar({
   onSubmit,
   onMicrophone,
   micActive,
+  voiceUnavailable,
   isProcessing,
   layoutMode,
   reducedMotion
@@ -35,10 +36,21 @@ export default function CommandBar({
         className={`command-bar__icon command-bar__mic ${micActive ? 'is-active' : ''}`}
         type="button"
         onClick={onMicrophone}
-        aria-label={micActive ? 'Stop listening preview' : 'Preview listening state'}
+        aria-label={
+          voiceUnavailable
+            ? 'Voice unavailable'
+            : micActive
+              ? 'Stop listening preview'
+              : 'Preview listening state'
+        }
         aria-pressed={micActive}
+        aria-disabled={voiceUnavailable || undefined}
         disabled={isProcessing}
-        title="Voice wake is active: say Hey Bunnelby or Hello Bunnelby"
+        title={
+          voiceUnavailable
+            ? 'Voice unavailable: the speech runtime is not running. See the terminal for the reason.'
+            : 'Voice wake is active: say Hey Bunnelby or Hello Bunnelby'
+        }
       >
         <span className="mic-glyph" aria-hidden="true" />
       </button>

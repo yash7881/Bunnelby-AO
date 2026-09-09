@@ -62,3 +62,6 @@ voice_lab_assets/
 # Local encrypted credentials / keys
 *.enc
 *.key
+
+# Durable per-machine voice interpreter override
+.bunnelby.local.json

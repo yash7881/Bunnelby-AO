@@ -152,10 +152,18 @@ function startVoiceRuntime() {
     const detail = describeInterpreterFailure(
       pythonExecutable,
       pythonSource,
-      interpreter.reason
+      interpreter.reason,
+      repoRoot
     );
     console.error(`[Bunnelby Voice] ${detail}`);
-    sendVoiceEvent({ event: 'runtime_error', message: detail });
+    // voice_unavailable is distinct from a transient runtime_error: it means
+    // no voice subsystem exists at all, so the UI must not look ready.
+    sendVoiceEvent({
+      event: 'runtime_error',
+      reason: 'interpreter_unavailable',
+      voice_unavailable: true,
+      message: detail
+    });
     return;
   }
 
@@ -183,6 +191,20 @@ function startVoiceRuntime() {
       stdio: ['pipe', 'pipe', 'pipe']
     }
   );
+
+  // Bounded, non-sensitive startup telemetry. No audio, no transcripts: just
+  // enough to answer "is there exactly one runtime, and which one" during an
+  // incident, which is precisely what was missing when wake silently died.
+  console.log(
+    `[Bunnelby Voice] voice_runtime_started pid=${voiceProcess.pid} ` +
+    `interpreter_source=${pythonSource}`
+  );
+  sendVoiceEvent({
+    event: 'voice_runtime_started',
+    pid: voiceProcess.pid,
+    interpreter: pythonExecutable,
+    interpreter_source: pythonSource
+  });
 
   voiceProcess.stdin.on('error', (error) => {
     if (!app.isQuitting && error?.code !== 'EPIPE') {
@@ -234,6 +256,7 @@ function startVoiceRuntime() {
         event: 'runtime_exit',
         code,
         signal,
+        voice_unavailable: true,
         message:
           `Voice runtime stopped${code == null ? '' : ` with code ${code}`}` +
           `${lastStderr ? `: ${lastStderr}` : '.'}`
