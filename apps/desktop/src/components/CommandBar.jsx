@@ -1,47 +1,21 @@
-import { useEffect, useState } from 'react';
 import { motion } from 'motion/react';
 
-const ACTIVE_RUNTIME_MIC_STATES = new Set(['wake_detected', 'listening', 'follow_up']);
-const INACTIVE_RUNTIME_MIC_STATES = new Set(['transcribing', 'thinking', 'speaking', 'standby']);
-
+// Presentational only. The mic highlight is decided by App's authoritative
+// voice-runtime state (see src/voiceMicState.mjs) and arrives as `micActive`.
+// This component deliberately holds no voice state and opens no event
+// subscription of its own: the previous `isListening || runtimeMicActive`
+// arrangement had two independent writers for one pixel, and they disagreed.
 export default function CommandBar({
   inputRef,
   message,
   onMessageChange,
   onSubmit,
   onMicrophone,
-  isListening,
+  micActive,
   isProcessing,
   layoutMode,
   reducedMotion
 }) {
-  const [runtimeMicActive, setRuntimeMicActive] = useState(false);
-
-  // The microphone indicator reflects the authoritative persistent voice runtime,
-  // not only App's shared visual core state. Core state also represents thinking,
-  // speaking and renderer transitions, so coupling the mic highlight to it can
-  // make a real LISTENING/FOLLOW_UP state disappear visually even though the
-  // microphone runtime is still active.
-  useEffect(() => {
-    const bridge = window.bunnelbyVoice;
-    if (!bridge?.onEvent) return undefined;
-
-    return bridge.onEvent((event) => {
-      if (!event || typeof event !== 'object' || event.event !== 'state') return;
-
-      const runtimeState = String(event.state || '').toLowerCase();
-      if (ACTIVE_RUNTIME_MIC_STATES.has(runtimeState)) {
-        setRuntimeMicActive(true);
-        return;
-      }
-
-      if (INACTIVE_RUNTIME_MIC_STATES.has(runtimeState)) {
-        setRuntimeMicActive(false);
-      }
-    });
-  }, []);
-
-  const micActive = isListening || runtimeMicActive;
   const placeholder = isProcessing
     ? 'Processing…'
     : layoutMode === 'response'

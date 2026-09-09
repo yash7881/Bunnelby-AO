@@ -10,6 +10,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test:self-wake": "node --test scripts/test-self-wake-bridge.cjs",
+    "test:mic-state": "node --test scripts/test-voice-mic-state.cjs",
     "test:session-id": "node --test scripts/test-session-id.cjs"
   },
   "dependencies": {
