@@ -4,11 +4,14 @@
   "private": true,
   "main": "electron.cjs",
   "scripts": {
-    "dev": "concurrently -k \"vite\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "predev": "node scripts/assert-dev-port-free.cjs",
+    "dev": "concurrently -k \"vite --host 127.0.0.1 --port 5173 --strictPort\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "dev:web": "vite",
     "build": "vite build",
     "preview": "vite preview",
     "test:self-wake": "node --test scripts/test-self-wake-bridge.cjs",
+    "test:mic-state": "node --test scripts/test-voice-mic-state.cjs",
+    "test:interpreter": "node --test scripts/test-voice-runtime-interpreter.cjs",
     "test:session-id": "node --test scripts/test-session-id.cjs"
   },
   "dependencies": {

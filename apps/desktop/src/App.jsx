@@ -8,6 +8,11 @@ import ResponseSurface from './components/ResponseSurface';
 import { createAOVoicePlayer } from './audio/aoVoicePlayer';
 import { createRendererSpeechGuard } from './rendererSpeechGuard.mjs';
 import { createSessionId } from './sessionId.mjs';
+import {
+  INITIAL_VOICE_RUNTIME_STATE,
+  isMicActive,
+  nextVoiceRuntimeState
+} from './voiceMicState.mjs';
 
 const API_BASE_URL = 'http://127.0.0.1:8000';
 const API_URL = `${API_BASE_URL}/chat`;
@@ -113,6 +118,17 @@ export default function App() {
   const [initialSetup] = useState(getDevelopmentSetup);
   const [layoutMode, setLayoutMode] = useState(initialSetup.response ? 'response' : 'home');
   const [coreState, setCoreState] = useState('idle');
+  // Authoritative persistent-voice-runtime phase. `coreState` above is a
+  // SHARED VISUAL state (it also encodes thinking, speaking and the mic-click
+  // preview), so it cannot be trusted to say whether the microphone is
+  // actually listening. This is the only value the mic highlight reads.
+  const [voiceRuntimeState, setVoiceRuntimeState] = useState(
+    INITIAL_VOICE_RUNTIME_STATE
+  );
+  // True when there is no working voice subsystem at all. The mic control
+  // must never advertise "say Hey Bunnelby" while the Python runtime is
+  // dead or was never able to start.
+  const [voiceUnavailable, setVoiceUnavailable] = useState(false);
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState(initialSetup.messages);
   const [activeResponse, setActiveResponse] = useState(initialSetup.response);
@@ -201,6 +217,16 @@ export default function App() {
 
       if (eventType === 'runtime_ready') {
         console.info('Bunnelby persistent voice runtime ready', event);
+        setVoiceUnavailable(false);
+        return;
+      }
+
+      if (eventType === 'voice_runtime_started') {
+        console.info(
+          `Bunnelby voice runtime started pid=${event.pid} ` +
+            `interpreter_source=${event.interpreter_source}`
+        );
+        setVoiceUnavailable(false);
         return;
       }
 
@@ -220,6 +246,11 @@ export default function App() {
         );
         return;
       }
+
+      // Single writer for the mic highlight, fed by this one subscription.
+      // Placed after the self-wake guard on purpose: an event the guard
+      // suppresses must not light the microphone either.
+      setVoiceRuntimeState((current) => nextVoiceRuntimeState(current, event));
 
       if (eventType === 'state') {
         const voiceState = String(event.state || '').toLowerCase();
@@ -327,6 +358,7 @@ export default function App() {
         console.error('Bunnelby voice runtime:', event.message || eventType);
         setSending(false);
         setCoreState('idle');
+        if (event.voice_unavailable === true) setVoiceUnavailable(true);
       }
     });
   }, []);
@@ -610,7 +642,8 @@ export default function App() {
         onMessageChange={setMessage}
         onSubmit={handleSubmit}
         onMicrophone={toggleListeningPreview}
-        isListening={coreState === 'listening'}
+        micActive={isMicActive(voiceRuntimeState)}
+        voiceUnavailable={voiceUnavailable}
         isProcessing={sending}
         layoutMode={layoutMode}
         reducedMotion={reducedMotion}

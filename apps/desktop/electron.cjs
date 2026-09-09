@@ -6,6 +6,11 @@ const readline = require('readline');
 const {
   encodeRendererSpeakingControl
 } = require('./voice-control-protocol.cjs');
+const {
+  describeInterpreterFailure,
+  resolveVoiceRuntime,
+  verifyVoiceRuntimeInterpreter
+} = require('./voiceRuntimeInterpreter.cjs');
 
 const DEV_ORIGIN = 'http://127.0.0.1:5173';
 const VOICE_EVENT_PREFIX = 'BUNNELBY_UI_EVENT ';
@@ -124,40 +129,15 @@ function flushVoiceEvents() {
   });
 }
 
-function resolveVoiceRuntime() {
-  const repoRoot = path.resolve(__dirname, '..', '..');
-  const runtimeScript = path.join(
-    repoRoot,
-    'scripts',
-    'wakeword',
-    'wake_conversation_runtime.py'
-  );
-
-  const configuredPython = (process.env.BUNNELBY_PYTHON || '').trim();
-  const venvPython = path.join(
-    repoRoot,
-    '.venv',
-    'Scripts',
-    'python.exe'
-  );
-
-  return {
-    repoRoot,
-    runtimeScript,
-    pythonExecutable:
-      configuredPython ||
-      (fs.existsSync(venvPython) ? venvPython : 'python')
-  };
-}
-
 function startVoiceRuntime() {
   if (voiceProcess || process.env.BUNNELBY_VOICE_BRIDGE === '0') return;
 
   const {
     repoRoot,
     runtimeScript,
-    pythonExecutable
-  } = resolveVoiceRuntime();
+    pythonExecutable,
+    pythonSource
+  } = resolveVoiceRuntime(__dirname);
 
   if (!fs.existsSync(runtimeScript)) {
     sendVoiceEvent({
@@ -166,6 +146,30 @@ function startVoiceRuntime() {
     });
     return;
   }
+
+  const interpreter = verifyVoiceRuntimeInterpreter(pythonExecutable);
+  if (!interpreter.ok) {
+    const detail = describeInterpreterFailure(
+      pythonExecutable,
+      pythonSource,
+      interpreter.reason,
+      repoRoot
+    );
+    console.error(`[Bunnelby Voice] ${detail}`);
+    // voice_unavailable is distinct from a transient runtime_error: it means
+    // no voice subsystem exists at all, so the UI must not look ready.
+    sendVoiceEvent({
+      event: 'runtime_error',
+      reason: 'interpreter_unavailable',
+      voice_unavailable: true,
+      message: detail
+    });
+    return;
+  }
+
+  console.log(
+    `[Bunnelby Voice] interpreter=${pythonExecutable} (${pythonSource})`
+  );
 
   voiceProcess = spawn(
     pythonExecutable,
@@ -187,6 +191,20 @@ function startVoiceRuntime() {
       stdio: ['pipe', 'pipe', 'pipe']
     }
   );
+
+  // Bounded, non-sensitive startup telemetry. No audio, no transcripts: just
+  // enough to answer "is there exactly one runtime, and which one" during an
+  // incident, which is precisely what was missing when wake silently died.
+  console.log(
+    `[Bunnelby Voice] voice_runtime_started pid=${voiceProcess.pid} ` +
+    `interpreter_source=${pythonSource}`
+  );
+  sendVoiceEvent({
+    event: 'voice_runtime_started',
+    pid: voiceProcess.pid,
+    interpreter: pythonExecutable,
+    interpreter_source: pythonSource
+  });
 
   voiceProcess.stdin.on('error', (error) => {
     if (!app.isQuitting && error?.code !== 'EPIPE') {
@@ -213,8 +231,13 @@ function startVoiceRuntime() {
     }
   });
 
+  let lastStderr = '';
   voiceProcess.stderr.on('data', (chunk) => {
-    console.error(`[Bunnelby Voice stderr] ${String(chunk).trim()}`);
+    const text = String(chunk).trim();
+    if (text) {
+      lastStderr = text.split(/\r?\n/).filter(Boolean).slice(-3).join(' | ');
+      console.error(`[Bunnelby Voice stderr] ${text}`);
+    }
   });
 
   voiceProcess.on('error', (error) => {
@@ -233,7 +256,10 @@ function startVoiceRuntime() {
         event: 'runtime_exit',
         code,
         signal,
-        message: `Voice runtime stopped${code == null ? '' : ` with code ${code}`}.`
+        voice_unavailable: true,
+        message:
+          `Voice runtime stopped${code == null ? '' : ` with code ${code}`}` +
+          `${lastStderr ? `: ${lastStderr}` : '.'}`
       });
     }
   });

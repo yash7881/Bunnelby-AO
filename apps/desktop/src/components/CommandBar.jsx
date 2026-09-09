@@ -1,12 +1,18 @@
 import { motion } from 'motion/react';
 
+// Presentational only. The mic highlight is decided by App's authoritative
+// voice-runtime state (see src/voiceMicState.mjs) and arrives as `micActive`.
+// This component deliberately holds no voice state and opens no event
+// subscription of its own: the previous `isListening || runtimeMicActive`
+// arrangement had two independent writers for one pixel, and they disagreed.
 export default function CommandBar({
   inputRef,
   message,
   onMessageChange,
   onSubmit,
   onMicrophone,
-  isListening,
+  micActive,
+  voiceUnavailable,
   isProcessing,
   layoutMode,
   reducedMotion
@@ -27,13 +33,24 @@ export default function CommandBar({
       transition={{ duration: reducedMotion ? 0.01 : 0.24 }}
     >
       <button
-        className={`command-bar__icon command-bar__mic ${isListening ? 'is-active' : ''}`}
+        className={`command-bar__icon command-bar__mic ${micActive ? 'is-active' : ''}`}
         type="button"
         onClick={onMicrophone}
-        aria-label={isListening ? 'Stop listening preview' : 'Preview listening state'}
-        aria-pressed={isListening}
+        aria-label={
+          voiceUnavailable
+            ? 'Voice unavailable'
+            : micActive
+              ? 'Stop listening preview'
+              : 'Preview listening state'
+        }
+        aria-pressed={micActive}
+        aria-disabled={voiceUnavailable || undefined}
         disabled={isProcessing}
-        title="Voice wake is active: say Hey Bunnelby or Hello Bunnelby"
+        title={
+          voiceUnavailable
+            ? 'Voice unavailable: the speech runtime is not running. See the terminal for the reason.'
+            : 'Voice wake is active: say Hey Bunnelby or Hello Bunnelby'
+        }
       >
         <span className="mic-glyph" aria-hidden="true" />
       </button>

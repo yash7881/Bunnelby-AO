@@ -330,6 +330,13 @@ input:focus-visible,
   box-shadow: 0 0 24px rgba(97, 231, 255, 0.11);
 }
 
+/* A genuinely listening microphone stays visible even while the button is
+   temporarily disabled. `.command-bar__icon:disabled` dims to 0.24, which is
+   enough to make a real cyan highlight read as "not highlighted" at a glance. */
+.command-bar__mic.is-active:disabled {
+  opacity: 1;
+}
+
 .mic-glyph {
   position: relative;
   width: 10px;

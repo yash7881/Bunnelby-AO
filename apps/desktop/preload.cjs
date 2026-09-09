@@ -1,4 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
+const {
+  normalizeVoiceEventForRenderer
+} = require('./voice-control-protocol.cjs');
 
 contextBridge.exposeInMainWorld('bunnelbyVoice', {
   setRendererSpeaking(isSpeaking) {
@@ -10,7 +13,9 @@ contextBridge.exposeInMainWorld('bunnelbyVoice', {
     if (typeof callback !== 'function') return () => {};
 
     const listener = (_event, payload) => {
-      if (payload && typeof payload === 'object') callback(payload);
+      if (!payload || typeof payload !== 'object') return;
+      const normalized = normalizeVoiceEventForRenderer(payload);
+      if (normalized && typeof normalized === 'object') callback(normalized);
     };
 
     ipcRenderer.on('bunnelby:voice-event', listener);
